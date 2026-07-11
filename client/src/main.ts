@@ -8,6 +8,16 @@ import {
   type ServerMessage,
 } from '../../shared/protocol.js'
 import { TransferClient, type StoredSession } from './transfer-client.js'
+
+function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (crypto.getRandomValues(new Uint8Array(1))[0] & 15) >> (c === 'x' ? 0 : 3)
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
+  })
+}
 import './styles.css'
 
 const SESSION_KEY = 'temporary-transfer-session'
@@ -297,7 +307,7 @@ async function sendContent(): Promise<void> {
   if (!text.trim() && !pendingImage) { showToast('请输入文字或选择图片'); return }
   try {
     if (text.trim()) {
-      const clientMessageId = crypto.randomUUID()
+      const clientMessageId = generateUUID()
       const sent = client.send({ type: 'text.send', clientMessageId, text })
       if (!sent) throw new Error('offline')
       textarea.value = ''
@@ -305,7 +315,7 @@ async function sendContent(): Promise<void> {
     }
     if (pendingImage) {
       const image = await client.uploadImage(pendingImage)
-      client.send({ type: 'image.send', clientMessageId: crypto.randomUUID(), image })
+      client.send({ type: 'image.send', clientMessageId: generateUUID(), image })
       pendingImage = undefined
       const preview = document.querySelector('.image-preview')
       if (preview) preview.innerHTML = ''
