@@ -1,0 +1,114 @@
+import type {
+  CreateRoomResponse,
+  ImageMetadata,
+  JoinRoomResponse,
+  ServerMessage,
+} from '../../shared/protocol.js'
+
+export interface StoredSession {
+  roomId: string
+  deviceToken: string
+  pairingCode?: string
+  expiresAt?: number
+  joinUrl?: string
+}
+
+export class TransferClient extends EventTarget {
+  private socket?: WebSocket
+  private reconnectTimer?: number
+  private reconnectStartedAt?: number
+  private heartbeatTimer?: number
+
+  constructor(public readonly session: StoredSession) {
+    super()
+  }
+
+  static async createRoom(): Promise<CreateRoomResponse> {
+    return TransferClient.request<CreateRoomResponse>('/api/rooms', { method: 'POST' })
+  }
+
+  static async joinRoom(pairingCode: string): Promise<JoinRoomResponse> {
+    return TransferClient.request<JoinRoomResponse>('/api/rooms/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pairingCode }),
+    })
+  }
+
+  connect(): void {
+    window.clearTimeout(this.reconnectTimer)
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const url = `${protocol}//${location.host}/ws?roomId=${encodeURIComponent(this.session.roomId)}&deviceToken=${encodeURIComponent(this.session.deviceToken)}`
+    this.socket = new WebSocket(url)
+    this.socket.addEventListener('open', () => {
+      this.reconnectStartedAt = undefined
+      this.dispatchEvent(new Event('connected'))
+      this.heartbeatTimer = window.setInterval(() => this.send({ type: 'ping' }), 25_000)
+    })
+    this.socket.addEventListener('message', (event) => {
+      const message = JSON.parse(String(event.data)) as ServerMessage
+      this.dispatchEvent(new CustomEvent<ServerMessage>('message', { detail: message }))
+    })
+    this.socket.addEventListener('close', (event) => {
+      window.clearInterval(this.heartbeatTimer)
+      this.dispatchEvent(new Event('disconnected'))
+      if (event.code === 4001 || event.code === 1000) return
+      this.scheduleReconnect()
+    })
+  }
+
+  send(message: object): boolean {
+    if (this.socket?.readyState !== WebSocket.OPEN) return false
+    this.socket.send(JSON.stringify(message))
+    return true
+  }
+
+  async uploadImage(file: File): Promise<ImageMetadata> {
+    const bytes = await file.arrayBuffer()
+    const binary = new Uint8Array(bytes)
+    let encoded = ''
+    for (let offset = 0; offset < binary.length; offset += 32_768) {
+      encoded += String.fromCharCode(...binary.subarray(offset, offset + 32_768))
+    }
+    return TransferClient.request<ImageMetadata>(`/api/rooms/${this.session.roomId}/images`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.session.deviceToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fileName: file.name, mimeType: file.type, bytes: btoa(encoded) }),
+    })
+  }
+
+  imageUrl(imageId: string): string {
+    return `/api/rooms/${this.session.roomId}/images/${imageId}`
+  }
+
+  async fetchImage(imageId: string): Promise<Blob> {
+    const response = await fetch(this.imageUrl(imageId), {
+      headers: { Authorization: `Bearer ${this.session.deviceToken}` },
+    })
+    if (!response.ok) throw await response.json()
+    return response.blob()
+  }
+
+  async close(): Promise<void> {
+    this.send({ type: 'session.close' })
+    this.socket?.close(1000)
+  }
+
+  private scheduleReconnect(): void {
+    this.reconnectStartedAt ??= Date.now()
+    if (Date.now() - this.reconnectStartedAt >= 60_000) {
+      this.dispatchEvent(new Event('expired'))
+      return
+    }
+    this.reconnectTimer = window.setTimeout(() => this.connect(), 2_000)
+  }
+
+  private static async request<T>(path: string, init: RequestInit): Promise<T> {
+    const response = await fetch(path, init)
+    if (!response.ok) throw await response.json()
+    return response.json() as Promise<T>
+  }
+}
