@@ -46,8 +46,12 @@ export class TransferClient extends EventTarget {
       this.heartbeatTimer = window.setInterval(() => this.send({ type: 'ping' }), 25_000)
     })
     this.socket.addEventListener('message', (event) => {
-      const message = JSON.parse(String(event.data)) as ServerMessage
-      this.dispatchEvent(new CustomEvent<ServerMessage>('message', { detail: message }))
+      try {
+        const message = JSON.parse(String(event.data)) as ServerMessage
+        this.dispatchEvent(new CustomEvent<ServerMessage>('message', { detail: message }))
+      } catch {
+        this.dispatchEvent(new CustomEvent('protocol-error'))
+      }
     })
     this.socket.addEventListener('close', (event) => {
       window.clearInterval(this.heartbeatTimer)
@@ -108,7 +112,14 @@ export class TransferClient extends EventTarget {
 
   private static async request<T>(path: string, init: RequestInit): Promise<T> {
     const response = await fetch(path, init)
-    if (!response.ok) throw await response.json()
-    return response.json() as Promise<T>
+    const body = await response.text()
+    let parsed: unknown
+    try {
+      parsed = body ? JSON.parse(body) : undefined
+    } catch {
+      parsed = undefined
+    }
+    if (!response.ok) throw parsed ?? { message: `请求失败（${response.status}）` }
+    return parsed as T
   }
 }

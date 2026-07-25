@@ -2,6 +2,8 @@ export const ROOM_PAIRING_TTL_MS = 5 * 60 * 1000
 export const RECONNECT_GRACE_MS = 60 * 1000
 export const MAX_TEXT_LENGTH = 10_000
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
+export const MAX_IDENTIFIER_LENGTH = 128
+export const MAX_FILE_NAME_LENGTH = 255
 
 export const SUPPORTED_IMAGE_TYPES = [
   'image/jpeg',
@@ -145,7 +147,7 @@ export function parseClientMessage(value: unknown): ClientMessage | ApiError {
     return { type: candidate.type }
   }
   if (candidate.type === 'text.send') {
-    if (typeof candidate.clientMessageId !== 'string' || candidate.clientMessageId.length === 0) {
+    if (!isValidIdentifier(candidate.clientMessageId)) {
       return { code: 'MESSAGE_INVALID', message: '消息标识无效' }
     }
     const textError = validateText(candidate.text)
@@ -157,17 +159,17 @@ export function parseClientMessage(value: unknown): ClientMessage | ApiError {
     }
   }
   if (candidate.type === 'image.send') {
-    if (typeof candidate.clientMessageId !== 'string' || candidate.clientMessageId.length === 0) {
+    if (!isValidIdentifier(candidate.clientMessageId)) {
       return { code: 'MESSAGE_INVALID', message: '消息标识无效' }
     }
     const image = candidate.image as Record<string, unknown> | undefined
     const imageError = validateImageUpload(image?.mimeType, image?.size)
     if (
       imageError
-      || typeof image?.imageId !== 'string'
-      || image.imageId.length === 0
+      || !isValidIdentifier(image?.imageId)
       || typeof image.fileName !== 'string'
-      || image.fileName.length === 0
+      || image.fileName.trim().length === 0
+      || image.fileName.length > MAX_FILE_NAME_LENGTH
     ) {
       return imageError ?? { code: 'MESSAGE_INVALID', message: '图片元数据无效' }
     }
@@ -177,10 +179,14 @@ export function parseClientMessage(value: unknown): ClientMessage | ApiError {
       image: image as unknown as ImageMetadata,
     }
   }
-  if (candidate.type === 'message.retry' && typeof candidate.clientMessageId === 'string') {
+  if (candidate.type === 'message.retry' && isValidIdentifier(candidate.clientMessageId)) {
     return { type: 'message.retry', clientMessageId: candidate.clientMessageId }
   }
   return { code: 'MESSAGE_INVALID', message: '消息格式无效' }
+}
+
+function isValidIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_IDENTIFIER_LENGTH
 }
 
 export function isSupportedImageType(value: string): value is SupportedImageType {

@@ -10,11 +10,15 @@ import {
 import { TransferClient, type StoredSession } from './transfer-client.js'
 
 function generateUUID(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID()
   }
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-    const r = (crypto.getRandomValues(new Uint8Array(1))[0] & 15) >> (c === 'x' ? 0 : 3)
+    const values = new Uint8Array(1)
+    const byte = typeof globalThis.crypto?.getRandomValues === 'function'
+      ? globalThis.crypto.getRandomValues(values)[0] ?? 0
+      : Math.floor(Math.random() * 256)
+    const r = (byte & 15) >> (c === 'x' ? 0 : 3)
     return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
   })
 }
@@ -28,6 +32,8 @@ let messages: MessageDeliverEvent['message'][] = []
 let connectionState: 'connecting' | 'online' | 'offline' = 'connecting'
 let peerOnline = false
 let pendingImage: File | undefined
+let pendingImagePreviewUrl: string | undefined
+const messageImageUrls = new Set<string>()
 
 function icon(name: string): string {
   const paths: Record<string, string> = {
@@ -61,6 +67,15 @@ function showToast(text: string): void {
   window.setTimeout(() => toast.remove(), 2600)
 }
 
+async function copyText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text)
+    showToast('已复制')
+  } catch {
+    showToast('复制失败，请手动选择文字')
+  }
+}
+
 function renderHome(joinCode = new URLSearchParams(location.search).get('code') ?? ''): void {
   if (!root) return
   root.innerHTML = `
@@ -70,7 +85,7 @@ function renderHome(joinCode = new URLSearchParams(location.search).get('code') 
         <div class="intro">
           <p class="eyebrow">DIRECT DEVICE TRANSFER</p>
           <h1>让文字和图片<br>在设备间自然流动</h1>
-          <p class="lead">创建一个临时会话，在电脑和手机之间即时传递内容。会话结束后，数据随即清除。</p>
+          <p class="lead">创建一个临时会话，在两个设备之间即时传递内容。会话结束后，数据随即清除。</p>
           <div class="privacy-note"><span class="live-dot"></span>无需登录 · 仅在会话期间保存</div>
         </div>
         <div class="action-panel">
@@ -139,8 +154,7 @@ async function renderPairing(): Promise<void> {
   const canvas = root.querySelector<HTMLCanvasElement>('#qr')
   if (canvas && session.joinUrl) await QRCode.toCanvas(canvas, session.joinUrl, { width: 220, margin: 1, color: { dark: '#141614', light: '#ffffff' } })
   root.querySelector('.code-copy')?.addEventListener('click', async () => {
-    await navigator.clipboard.writeText(session?.pairingCode ?? '')
-    showToast('配对码已复制')
+    await copyText(session?.pairingCode ?? '')
   })
   root.querySelector('.end-session')?.addEventListener('click', endSession)
   updateCountdown()
@@ -229,6 +243,8 @@ function renderMessages(): void {
   const container = root?.querySelector<HTMLElement>('.messages')
   if (!container || !client) return
   if (messages.length === 0) return
+  for (const url of messageImageUrls) URL.revokeObjectURL(url)
+  messageImageUrls.clear()
   container.innerHTML = ''
   for (const message of messages) {
     const item = document.createElement('article')
@@ -244,7 +260,7 @@ function renderMessages(): void {
       copy.className = 'icon-button message-action'
       copy.title = '复制文字'
       copy.innerHTML = icon('copy')
-      copy.addEventListener('click', async () => { await navigator.clipboard.writeText(message.text ?? ''); showToast('文字已复制') })
+       copy.addEventListener('click', () => { void copyText(message.text ?? '') })
       item.append(content, copy)
     } else if (message.image) {
       const image = document.createElement('div')
@@ -269,6 +285,7 @@ async function loadImagePreview(target: HTMLElement, imageId: string): Promise<v
   try {
     const blob = await client.fetchImage(imageId)
     const url = URL.createObjectURL(blob)
+    messageImageUrls.add(url)
     const preview = document.createElement('img')
     preview.src = url
     preview.alt = ''
@@ -291,12 +308,19 @@ function selectImage(event: Event): void {
   const file = (event.target as HTMLInputElement).files?.[0]
   if (!file) return
   if (file.size > MAX_IMAGE_BYTES) { showToast('图片大小不能超过 10 MB'); return }
+  if (pendingImagePreviewUrl) URL.revokeObjectURL(pendingImagePreviewUrl)
+  pendingImagePreviewUrl = URL.createObjectURL(file)
   pendingImage = file
   const preview = root?.querySelector<HTMLElement>('.image-preview')
   if (preview) {
-    preview.innerHTML = `<div><img src="${URL.createObjectURL(file)}" alt=""><span><strong></strong><small>${formatBytes(file.size)}</small></span><button class="icon-button" title="移除图片">${icon('x')}</button></div>`
+    preview.innerHTML = `<div><img src="${pendingImagePreviewUrl}" alt=""><span><strong></strong><small>${formatBytes(file.size)}</small></span><button class="icon-button" title="移除图片">${icon('x')}</button></div>`
     preview.querySelector('strong')!.textContent = file.name
-    preview.querySelector('button')?.addEventListener('click', () => { pendingImage = undefined; preview.innerHTML = '' })
+    preview.querySelector('button')?.addEventListener('click', () => {
+      pendingImage = undefined
+      if (pendingImagePreviewUrl) URL.revokeObjectURL(pendingImagePreviewUrl)
+      pendingImagePreviewUrl = undefined
+      preview.innerHTML = ''
+    })
   }
 }
 
@@ -315,8 +339,11 @@ async function sendContent(): Promise<void> {
     }
     if (pendingImage) {
       const image = await client.uploadImage(pendingImage)
-      client.send({ type: 'image.send', clientMessageId: generateUUID(), image })
+      const sent = client.send({ type: 'image.send', clientMessageId: generateUUID(), image })
+      if (!sent) throw new Error('offline')
       pendingImage = undefined
+      if (pendingImagePreviewUrl) URL.revokeObjectURL(pendingImagePreviewUrl)
+      pendingImagePreviewUrl = undefined
       const preview = document.querySelector('.image-preview')
       if (preview) preview.innerHTML = ''
     }
@@ -331,6 +358,11 @@ async function endSession(): Promise<void> {
 }
 
 function leaveSession(): void {
+  if (pendingImagePreviewUrl) URL.revokeObjectURL(pendingImagePreviewUrl)
+  for (const url of messageImageUrls) URL.revokeObjectURL(url)
+  messageImageUrls.clear()
+  pendingImagePreviewUrl = undefined
+  pendingImage = undefined
   client = undefined
   messages = []
   setSession()

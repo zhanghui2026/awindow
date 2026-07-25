@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest'
 import {
   MAX_TEXT_LENGTH,
   MAX_IMAGE_BYTES,
+  MAX_FILE_NAME_LENGTH,
+  MAX_IDENTIFIER_LENGTH,
   isSupportedImageType,
   parseClientMessage,
   validateText,
@@ -34,6 +36,15 @@ describe('shared protocol validation', () => {
       text: 'hello',
     })).toMatchObject({ type: 'text.send', text: 'hello' })
     expect(parseClientMessage({ type: 'unknown' })).toMatchObject({ code: 'MESSAGE_INVALID' })
+    expect(parseClientMessage({
+      type: 'text.send',
+      clientMessageId: 'a'.repeat(MAX_IDENTIFIER_LENGTH + 1),
+      text: 'hello',
+    })).toMatchObject({ code: 'MESSAGE_INVALID' })
+    expect(parseClientMessage({
+      type: 'message.retry',
+      clientMessageId: '',
+    })).toMatchObject({ code: 'MESSAGE_INVALID' })
   })
 
   it('enforces image type and size boundaries', () => {
@@ -55,5 +66,15 @@ describe('shared protocol validation', () => {
         size: 4,
       },
     })).toMatchObject({ type: 'image.send', image: { imageId: 'image-1' } })
+    expect(parseClientMessage({
+      type: 'image.send',
+      clientMessageId: 'image-message-2',
+      image: {
+        imageId: 'image-2',
+        fileName: 'a'.repeat(MAX_FILE_NAME_LENGTH + 1),
+        mimeType: 'image/png',
+        size: 4,
+      },
+    })).toMatchObject({ code: 'MESSAGE_INVALID' })
   })
 })

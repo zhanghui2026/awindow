@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto'
 
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
-import { validateImageUpload, type JoinRoomRequest, type SupportedImageType } from '../../shared/protocol.js'
+import {
+  MAX_FILE_NAME_LENGTH,
+  validateImageUpload,
+  type JoinRoomRequest,
+  type SupportedImageType,
+} from '../../shared/protocol.js'
 import { RoomError } from './errors.js'
 import type { RoomService } from './room-service.js'
 import type { RateLimiter } from '../security/rate-limiter.js'
@@ -33,8 +38,18 @@ export async function registerRoomRoutes(
   app: FastifyInstance,
   roomService: RoomService,
   invalidPairingLimiter: RateLimiter,
+  roomCreationLimiter: RateLimiter,
 ): Promise<void> {
-  app.post('/api/rooms', async (_request, reply) => {
+  app.post('/api/rooms', async (request, reply) => {
+    const rateLimit = roomCreationLimiter.consume(request.ip)
+    if (!rateLimit.allowed) {
+      throw new RoomError(
+        'RATE_LIMITED',
+        `请求过于频繁，请在 ${rateLimit.retryAfterSeconds} 秒后重试`,
+        429,
+        rateLimit.retryAfterSeconds,
+      )
+    }
     return reply.code(201).send(roomService.createRoom())
   })
 
@@ -76,9 +91,13 @@ export async function registerRoomRoutes(
       const statusCode = validationError.code === 'IMAGE_TOO_LARGE' ? 413 : 415
       throw new RoomError(validationError.code, validationError.message, statusCode)
     }
+    const fileName = request.body?.fileName?.trim() ?? ''
+    if (fileName.length === 0 || fileName.length > MAX_FILE_NAME_LENGTH) {
+      throw new RoomError('IMAGE_METADATA_INVALID', '图片文件名无效', 400)
+    }
     const image = {
       imageId: randomUUID(),
-      fileName: request.body?.fileName?.trim() || 'image',
+      fileName,
       mimeType: request.body.mimeType as SupportedImageType,
       size: bytes.length,
     }

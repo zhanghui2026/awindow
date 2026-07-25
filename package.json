@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server/index.ts",
-    "build": "tsc -p tsconfig.json && vite build",
+    "build": "npm run lint && tsc -p tsconfig.server.json && vite build",
+    "start": "node dist/server/index.js",
     "lint": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --config vitest.config.ts",
     "test:e2e": "playwright test --config playwright.config.ts"

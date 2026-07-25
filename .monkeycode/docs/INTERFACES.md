@@ -14,7 +14,7 @@
 
 ### `POST /api/rooms`
 
-创建临时房间并返回 `roomId`、6 位 `pairingCode`、创建方 `deviceToken`、`expiresAt` 和 `joinUrl`。成功状态码为 `201`。
+创建临时房间并返回 `roomId`、6 位 `pairingCode`、创建方 `deviceToken`、`expiresAt` 和 `joinUrl`。成功状态码为 `201`。单个来源每分钟最多创建 20 个房间。
 
 ### `POST /api/rooms/join`
 
@@ -34,7 +34,7 @@
 
 ### `POST /api/rooms/:roomId/images`
 
-请求头使用 `Authorization: Bearer <DEVICE_TOKEN>`，JSON 请求体包含 `fileName`、`mimeType` 和 Base64 编码的 `bytes`。接口接受 JPEG、PNG、WebP 和 GIF，单图原始内容上限为 10 MB。成功状态码为 `201`，响应包含 `imageId`、文件名、MIME 类型和原始字节数。
+请求头使用 `Authorization: Bearer <DEVICE_TOKEN>`，JSON 请求体包含 `fileName`、`mimeType` 和 Base64 编码的 `bytes`。接口接受 JPEG、PNG、WebP 和 GIF，单图原始内容上限为 10 MB，文件名长度为 1 到 255 个字符。成功状态码为 `201`，响应包含 `imageId`、文件名、MIME 类型和原始字节数。
 
 ### `GET /api/rooms/:roomId/images/:imageId`
 
@@ -42,7 +42,7 @@
 
 ### 错误响应
 
-房间接口当前可能返回 `PAIRING_CODE_INVALID`、`ROOM_EXPIRED`、`ROOM_FULL`、`SESSION_UNAUTHORIZED` 和 `INTERNAL_ERROR`。图片接口还可能返回 `IMAGE_TYPE_UNSUPPORTED`、`IMAGE_TOO_LARGE`、`IMAGE_NOT_FOUND` 和 `IMAGE_CAPACITY_EXCEEDED`。限流响应使用 `RATE_LIMITED`，HTTP 状态码为 `429`，并通过 `retryAfterSeconds` 返回等待时间。
+房间接口当前可能返回 `PAIRING_CODE_INVALID`、`ROOM_EXPIRED`、`ROOM_FULL`、`SESSION_UNAUTHORIZED` 和 `INTERNAL_ERROR`。图片接口还可能返回 `IMAGE_TYPE_UNSUPPORTED`、`IMAGE_TOO_LARGE`、`IMAGE_METADATA_INVALID`、`IMAGE_NOT_FOUND` 和 `IMAGE_CAPACITY_EXCEEDED`。限流响应使用 `RATE_LIMITED`，HTTP 状态码为 `429`，并通过 `Retry-After` 响应头和 `retryAfterSeconds` 字段返回等待时间。
 
 ## 共享协议
 
@@ -52,7 +52,7 @@
 - 客户端消息：文字发送、图片发送、消息重试、会话关闭和心跳。
 - 服务端消息：会话就绪、配对完成、设备在线状态、消息投递、消息确认、心跳响应、会话关闭和错误。
 - API 数据：创建房间响应、加入房间请求和响应、图片元数据。
-- 限制常量：5 分钟配对有效期、60 秒重连窗口、10000 字符文字上限和 10 MB 图片上限。
+- 限制常量：5 分钟配对有效期、60 秒重连窗口、10000 字符文字上限、10 MB 图片上限、128 字符消息标识上限和 255 字符文件名上限。
 - 图片格式：JPEG、PNG、WebP 和 GIF。
 
 ## 校验函数
@@ -72,11 +72,11 @@
 
 设备连接和断开时，对端分别收到 `peer.online` 和 `peer.offline`。设备在 60 秒宽限期内使用原令牌重连时，`session.ready` 会恢复房间中的消息视图。任一设备发送 `session.close` 后，连接中的设备收到 `session.closed`，房间内存随即清理。
 
-每个 WebSocket 连接一分钟允许处理 60 条客户端消息。超限消息返回 `error` 事件，其中错误码为 `RATE_LIMITED`，`retryAfterSeconds` 为剩余暂停时间。
+每个 WebSocket 连接一分钟允许处理 60 条客户端消息，单个入站帧上限为 16 KiB。超限消息返回 `error` 事件，其中错误码为 `RATE_LIMITED`，`retryAfterSeconds` 为剩余暂停时间。
 
 ## HTTP 安全响应头
 
-所有 HTTP 响应包含 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 和限制同源资源的 `Content-Security-Policy`。
+所有 HTTP 响应包含 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Cache-Control: no-store`、受限的 `Permissions-Policy` 和限制同源资源的 `Content-Security-Policy`。
 
 ## 浏览器客户端
 

@@ -50,8 +50,9 @@ shared/
 
 ## 构建流程
 
-TypeScript 执行全项目类型检查，Vite 从 `client` 目录构建静态资源并输出到 `dist/client`。服务端当前通过 `tsx` 在开发模式运行。
+`npm run build` 先执行全项目 TypeScript 类型检查，再使用 `tsconfig.server.json` 将服务端和共享协议编译到 `dist/server` 与 `dist/shared`，最后由 Vite 将浏览器静态资源输出到 `dist/client`。开发模式通过 `tsx` 运行服务端，生产模式通过 `npm start` 运行 `dist/server/index.js`。生产部署由 Nginx 托管 `dist/client`，并将 `/api`、`/health` 和 `/ws` 转发至单个 Fastify 实例。
 
 ## 已实现边界
 
-- Playwright 使用桌面 Chrome 和 iPhone 13 移动视口仿真验证首页、配对页和双设备工作区流程。
+- Playwright 使用桌面 Chrome 和 iPhone 13 移动视口仿真验证首页、配对页、双设备工作区，以及真实文字和图片传输流程。
+- WebRTC DataChannel 尚未进入实现，当前规格位于 `.monkeycode/specs/2026-07-19-webrtc-data-transfer/`。

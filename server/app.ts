@@ -12,14 +12,23 @@ export interface AppOptions extends RoomServiceOptions {
   cleanupIntervalMs?: number
   logger?: boolean
   now?: () => number
+  trustProxy?: boolean
 }
 
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
-  const app = Fastify({ logger: options.logger ?? false, bodyLimit: 15 * 1024 * 1024 })
+  const app = Fastify({
+    logger: options.logger ?? false,
+    bodyLimit: 15 * 1024 * 1024,
+    trustProxy: options.trustProxy ?? false,
+  })
   const repository = new RoomRepository()
   const roomService = new RoomService(repository, options)
   const invalidPairingLimiter = new RateLimiter(
     { limit: 10, windowMs: 60_000, blockMs: 5 * 60_000 },
+    options.now,
+  )
+  const roomCreationLimiter = new RateLimiter(
+    { limit: 20, windowMs: 60_000, blockMs: 60_000 },
     options.now,
   )
   const cleanupTimer = setInterval(
@@ -35,12 +44,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       .header('X-Content-Type-Options', 'nosniff')
       .header('X-Frame-Options', 'DENY')
       .header('Referrer-Policy', 'no-referrer')
+      .header('Cache-Control', 'no-store')
+      .header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
       .header('Content-Security-Policy', "default-src 'self'; img-src 'self' blob: data:; connect-src 'self' ws: wss:")
     return payload
   })
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof RoomError) {
+      if (error.retryAfterSeconds !== undefined) {
+        reply.header('Retry-After', error.retryAfterSeconds)
+      }
       const body: ApiError = {
         code: error.code,
         message: error.message,
@@ -54,7 +68,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   })
 
   app.get('/health', async () => ({ status: 'ok' }))
-  await registerRoomRoutes(app, roomService, invalidPairingLimiter)
+  await registerRoomRoutes(app, roomService, invalidPairingLimiter, roomCreationLimiter)
   registerWebSocketGateway(app, roomService, options.now)
 
   return app

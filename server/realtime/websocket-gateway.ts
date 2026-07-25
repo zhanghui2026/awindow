@@ -32,7 +32,7 @@ export function registerWebSocketGateway(
   roomService: RoomService,
   now?: () => number,
 ): void {
-  const server = new WebSocketServer({ noServer: true })
+  const server = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 })
   const connections = new Map<string, WebSocket>()
   const contexts = new WeakMap<WebSocket, ConnectionContext>()
 

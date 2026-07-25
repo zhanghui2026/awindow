@@ -121,6 +121,25 @@ describe('room HTTP routes', () => {
     expect(unauthorized.statusCode).toBe(401)
   })
 
+  it('rejects invalid image file names', async () => {
+    const app = await buildApp()
+    apps.push(app)
+    const created = (await app.inject({ method: 'POST', url: '/api/rooms' })).json<{
+      roomId: string
+      deviceToken: string
+    }>()
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/rooms/${created.roomId}/images`,
+      headers: { authorization: `Bearer ${created.deviceToken}` },
+      payload: { fileName: '   ', mimeType: 'image/png', bytes: 'dGVzdA==' },
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toMatchObject({ code: 'IMAGE_METADATA_INVALID' })
+  })
+
   it('isolates images between rooms', async () => {
     const app = await buildApp()
     apps.push(app)
@@ -168,6 +187,21 @@ describe('room HTTP routes', () => {
 
     expect(blocked.statusCode).toBe(429)
     expect(blocked.json()).toMatchObject({ code: 'RATE_LIMITED', retryAfterSeconds: 300 })
+    expect(blocked.headers['retry-after']).toBe('300')
+  })
+
+  it('rate limits room creation by source', async () => {
+    const app = await buildApp()
+    apps.push(app)
+
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const response = await app.inject({ method: 'POST', url: '/api/rooms' })
+      expect(response.statusCode).toBe(201)
+    }
+    const blocked = await app.inject({ method: 'POST', url: '/api/rooms' })
+
+    expect(blocked.statusCode).toBe(429)
+    expect(blocked.headers['retry-after']).toBe('60')
   })
 
   it('adds security headers and preserves user-controlled text as data', async () => {
@@ -178,6 +212,8 @@ describe('room HTTP routes', () => {
     expect(response.headers['x-content-type-options']).toBe('nosniff')
     expect(response.headers['x-frame-options']).toBe('DENY')
     expect(response.headers['referrer-policy']).toBe('no-referrer')
+    expect(response.headers['cache-control']).toBe('no-store')
+    expect(response.headers['permissions-policy']).toContain('camera=()')
     expect(response.headers['content-security-policy']).toContain("default-src 'self'")
 
     const created = (await app.inject({ method: 'POST', url: '/api/rooms' })).json<{

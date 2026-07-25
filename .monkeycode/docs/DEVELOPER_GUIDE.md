@@ -15,8 +15,11 @@ npm test
 # 运行桌面和移动视口 Playwright E2E
 npm run test:e2e
 
-# 执行 TypeScript 检查并构建前端
+# 执行 TypeScript 检查并构建前端与服务端
 npm run build
+
+# 运行编译后的生产服务
+npm start
 ```
 
 ## 开发约定
@@ -31,7 +34,6 @@ npm run build
 
 - TypeScript 类型检查通过。
 - 共享协议、房间生命周期、HTTP 路由、WebSocket 网关和限流器包含 29 个通过的单元及集成测试。
-- Playwright 包含 6 个通过的桌面与移动端 E2E，覆盖首页布局、创建房间和双设备配对工作区。
-- Vite 生产构建通过，产物输出到 `dist/client`。
+- Playwright 包含 8 个通过的桌面与移动端 E2E，覆盖首页布局、创建房间、双设备配对，以及真实文字和图片传输。
+- 生产构建通过，前端产物输出到 `dist/client`，服务端产物输出到 `dist/server` 和 `dist/shared`。
 - 本地预览：Fastify 使用 `npm run dev` 启动在 `3001`，Vite 使用 `npm exec vite -- --host 0.0.0.0 --port 5173` 启动在 `5173`；Vite 代理 `/api`、`/health` 和 `/ws`。
-- 当前预览地址：`https://5173-d9b1166670274e72.monkeycode-ai.online`。

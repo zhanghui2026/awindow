@@ -42,3 +42,39 @@ test('pairs two browser tabs and opens the transfer workspace', async ({ browser
   await creatorContext.close()
   await joinerContext.close()
 })
+
+test('transfers text and an image between two devices', async ({ browser }) => {
+  const creatorContext = await browser.newContext()
+  const joinerContext = await browser.newContext()
+  const creator = await creatorContext.newPage()
+  const joiner = await joinerContext.newPage()
+
+  await creator.goto('/')
+  await creator.getByRole('button', { name: '创建传输房间' }).click()
+  const pairingCode = await creator.locator('.code-copy strong').innerText()
+
+  await joiner.goto('/')
+  await joiner.getByLabel('6 位配对码').fill(pairingCode)
+  await joiner.getByRole('button', { name: '加入' }).click()
+  await expect(creator.locator('.connection-pill')).toContainText('两台设备在线')
+
+  await creator.getByPlaceholder('输入要传送的文字').fill('来自设备 A 的文字')
+  await creator.getByTitle('发送').click()
+  await expect(joiner.locator('.message-item pre')).toHaveText('来自设备 A 的文字')
+
+  await joiner.locator('input[type=file]').setInputFiles({
+    name: 'transfer.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    ),
+  })
+  await expect(joiner.locator('.image-preview strong')).toHaveText('transfer.png')
+  await joiner.getByTitle('发送').click()
+  await expect(creator.locator('.image-message strong')).toHaveText('transfer.png')
+  await expect(creator.locator('.image-message img')).toBeVisible()
+
+  await creatorContext.close()
+  await joinerContext.close()
+})

@@ -128,20 +128,22 @@ Vite 会把 `/api`、`/health` 和 `/ws` 代理到 `127.0.0.1:3001`。
 |---|---|---|
 | `PORT` | `3001` | Fastify 服务端口 |
 | `PUBLIC_BASE_URL` | `http://localhost:<PORT>` | 二维码和加入链接使用的公网基础地址 |
+| `TRUST_PROXY` | `false` | 是否信任反向代理传递的客户端地址；仅在受控代理后设置为 `true` |
 
 生产环境必须把 `PUBLIC_BASE_URL` 设置为用户实际访问的 HTTPS 地址：
 
 ```bash
 export PORT=3001
 export PUBLIC_BASE_URL=https://transfer.example.com
-npm run dev
+export TRUST_PROXY=true
+npm start
 ```
 
 ## 生产部署
 
 推荐使用单个 Node.js 服务实例，并由 Nginx 提供 HTTPS、静态文件和同源反向代理。房间数据保存在进程内存中，多实例部署会导致房间状态分散。
 
-### 1. 构建前端
+### 1. 构建应用
 
 ```bash
 npm run build
@@ -150,7 +152,9 @@ npm run build
 构建产物位于：
 
 ```text
-dist/client
+dist/client          前端静态资源
+dist/server          编译后的服务端
+dist/shared          服务端使用的共享协议
 ```
 
 ### 2. 启动后端
@@ -158,7 +162,8 @@ dist/client
 ```bash
 export PORT=3001
 export PUBLIC_BASE_URL=https://transfer.example.com
-npm run dev
+export TRUST_PROXY=true
+npm start
 ```
 
 后端仅监听 `127.0.0.1`，适合由同一主机上的 Nginx 转发。
@@ -246,7 +251,8 @@ WorkingDirectory=/opt/awindow
 Environment=NODE_ENV=production
 Environment=PORT=3001
 Environment=PUBLIC_BASE_URL=https://transfer.example.com
-ExecStart=/usr/bin/npm run dev
+Environment=TRUST_PROXY=true
+ExecStart=/usr/bin/npm start
 Restart=always
 RestartSec=5
 
