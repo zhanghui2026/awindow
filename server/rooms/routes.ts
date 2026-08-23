@@ -3,10 +3,9 @@ import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import {
-  MAX_FILE_NAME_LENGTH,
-  validateImageUpload,
+  MAX_ENCRYPTED_IMAGE_BYTES,
   type JoinRoomRequest,
-  type SupportedImageType,
+  type WebRtcConfigResponse,
 } from '../../shared/protocol.js'
 import { RoomError } from './errors.js'
 import type { RoomService } from './room-service.js'
@@ -21,9 +20,19 @@ interface ImageParams extends RoomParams {
 }
 
 interface ImageUploadBody {
-  fileName?: string
-  mimeType?: string
+  transferId?: string
   bytes?: string
+}
+
+interface WebRtcConfigQuery {
+  roomId: string
+}
+
+function decodeBase64(value: unknown): Buffer {
+  if (typeof value !== 'string' || value.length === 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)) {
+    throw new RoomError('ENCRYPTED_PAYLOAD_INVALID', '加密图片载荷无效', 400)
+  }
+  return Buffer.from(value, 'base64')
 }
 
 function readDeviceToken(request: FastifyRequest): string {
@@ -39,6 +48,7 @@ export async function registerRoomRoutes(
   roomService: RoomService,
   invalidPairingLimiter: RateLimiter,
   roomCreationLimiter: RateLimiter,
+  webRtcConfig: WebRtcConfigResponse,
 ): Promise<void> {
   app.post('/api/rooms', async (request, reply) => {
     const rateLimit = roomCreationLimiter.consume(request.ip)
@@ -75,6 +85,11 @@ export async function registerRoomRoutes(
     }
   })
 
+  app.get<{ Querystring: WebRtcConfigQuery }>('/api/webrtc/config', async (request) => {
+    roomService.authorize(request.query.roomId, readDeviceToken(request))
+    return webRtcConfig
+  })
+
   app.delete<{ Params: RoomParams }>('/api/rooms/:roomId', async (request, reply) => {
     roomService.closeRoom(request.params.roomId, readDeviceToken(request))
     return reply.code(204).send()
@@ -83,38 +98,35 @@ export async function registerRoomRoutes(
   app.post<{ Params: RoomParams; Body: ImageUploadBody }>('/api/rooms/:roomId/images', async (request, reply) => {
     const deviceToken = readDeviceToken(request)
     roomService.authorize(request.params.roomId, deviceToken)
-    const bytes = typeof request.body?.bytes === 'string'
-      ? Buffer.from(request.body.bytes, 'base64')
-      : Buffer.alloc(0)
-    const validationError = validateImageUpload(request.body?.mimeType, bytes.length)
-    if (validationError) {
-      const statusCode = validationError.code === 'IMAGE_TOO_LARGE' ? 413 : 415
-      throw new RoomError(validationError.code, validationError.message, statusCode)
+    const transferId = request.body?.transferId
+    if (typeof transferId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(transferId)) {
+      throw new RoomError('ENCRYPTED_PAYLOAD_INVALID', '图片传输标识无效', 400)
     }
-    const fileName = request.body?.fileName?.trim() ?? ''
-    if (fileName.length === 0 || fileName.length > MAX_FILE_NAME_LENGTH) {
-      throw new RoomError('IMAGE_METADATA_INVALID', '图片文件名无效', 400)
-    }
-    const image = {
-      imageId: randomUUID(),
-      fileName,
-      mimeType: request.body.mimeType as SupportedImageType,
-      size: bytes.length,
-    }
-    roomService.addImage(request.params.roomId, deviceToken, image, bytes)
-    return reply.code(201).send(image)
+    const bytes = decodeBase64(request.body?.bytes)
+    if (bytes.length > MAX_ENCRYPTED_IMAGE_BYTES) throw new RoomError('IMAGE_TOO_LARGE', '加密图片载荷超过上限', 413)
+    const result = roomService.addEncryptedImage(
+      request.params.roomId,
+      deviceToken,
+      transferId,
+      randomUUID(),
+      bytes,
+    )
+    return reply.code(result.duplicate ? 200 : 201).send({
+      imageId: result.image.imageId,
+      transferId: result.image.transferId,
+      size: result.image.bytes.length,
+      duplicate: result.duplicate,
+    })
   })
 
   app.get<{ Params: ImageParams }>('/api/rooms/:roomId/images/:imageId', async (request, reply) => {
-    const image = roomService.getImage(
+    const bytes = roomService.getEncryptedImage(
       request.params.roomId,
       readDeviceToken(request),
       request.params.imageId,
     )
-    const fileName = image.metadata.fileName.replace(/["\r\n]/g, '')
     return reply
-      .type(image.metadata.mimeType)
-      .header('Content-Disposition', `inline; filename="${fileName}"`)
-      .send(image.bytes)
+      .type('application/octet-stream')
+      .send(bytes)
   })
 }

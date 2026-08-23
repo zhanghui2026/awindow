@@ -1,9 +1,12 @@
 import type {
   CreateRoomResponse,
-  ImageMetadata,
+  ClientMessage,
+  EncryptedImageUploadResponse,
   JoinRoomResponse,
   ServerMessage,
+  WebRtcConfigResponse,
 } from '../../shared/protocol.js'
+import type { StoredCryptoSession } from './crypto-session.js'
 
 export interface StoredSession {
   roomId: string
@@ -11,6 +14,8 @@ export interface StoredSession {
   pairingCode?: string
   expiresAt?: number
   joinUrl?: string
+  verificationExpiresAt?: number
+  crypto?: StoredCryptoSession
 }
 
 export class TransferClient extends EventTarget {
@@ -32,6 +37,13 @@ export class TransferClient extends EventTarget {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pairingCode }),
+    })
+  }
+
+  async webRtcConfig(): Promise<WebRtcConfigResponse> {
+    return TransferClient.request<WebRtcConfigResponse>(`/api/webrtc/config?roomId=${encodeURIComponent(this.session.roomId)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${this.session.deviceToken}` },
     })
   }
 
@@ -61,26 +73,24 @@ export class TransferClient extends EventTarget {
     })
   }
 
-  send(message: object): boolean {
+  send(message: ClientMessage): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN) return false
     this.socket.send(JSON.stringify(message))
     return true
   }
 
-  async uploadImage(file: File): Promise<ImageMetadata> {
-    const bytes = await file.arrayBuffer()
-    const binary = new Uint8Array(bytes)
+  async uploadEncryptedImage(transferId: string, binary: Uint8Array<ArrayBuffer>): Promise<EncryptedImageUploadResponse> {
     let encoded = ''
     for (let offset = 0; offset < binary.length; offset += 32_768) {
       encoded += String.fromCharCode(...binary.subarray(offset, offset + 32_768))
     }
-    return TransferClient.request<ImageMetadata>(`/api/rooms/${this.session.roomId}/images`, {
+    return TransferClient.request<EncryptedImageUploadResponse>(`/api/rooms/${this.session.roomId}/images`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.session.deviceToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ fileName: file.name, mimeType: file.type, bytes: btoa(encoded) }),
+      body: JSON.stringify({ transferId, bytes: btoa(encoded) }),
     })
   }
 
@@ -88,17 +98,24 @@ export class TransferClient extends EventTarget {
     return `/api/rooms/${this.session.roomId}/images/${imageId}`
   }
 
-  async fetchImage(imageId: string): Promise<Blob> {
+  async fetchEncryptedImage(imageId: string): Promise<ArrayBuffer> {
     const response = await fetch(this.imageUrl(imageId), {
       headers: { Authorization: `Bearer ${this.session.deviceToken}` },
     })
     if (!response.ok) throw await response.json()
-    return response.blob()
+    return response.arrayBuffer()
   }
 
   async close(): Promise<void> {
     this.send({ type: 'session.close' })
+    this.disconnect()
+  }
+
+  disconnect(): void {
+    window.clearTimeout(this.reconnectTimer)
+    window.clearInterval(this.heartbeatTimer)
     this.socket?.close(1000)
+    this.socket = undefined
   }
 
   private scheduleReconnect(): void {

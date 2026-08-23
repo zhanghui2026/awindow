@@ -4,8 +4,10 @@ import type { FastifyInstance } from 'fastify'
 import { WebSocket, WebSocketServer } from 'ws'
 
 import {
+  MAX_WEBSOCKET_PAYLOAD_BYTES,
   parseClientMessage,
   type ApiError,
+  type DeviceRole,
   type MessageDeliverEvent,
   type ServerMessage,
 } from '../../shared/protocol.js'
@@ -17,6 +19,7 @@ interface ConnectionContext {
   roomId: string
   deviceToken: string
   deviceId: string
+  role: DeviceRole
 }
 
 function send(socket: WebSocket, message: ServerMessage): void {
@@ -32,7 +35,7 @@ export function registerWebSocketGateway(
   roomService: RoomService,
   now?: () => number,
 ): void {
-  const server = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 })
+  const server = new WebSocketServer({ noServer: true, maxPayload: MAX_WEBSOCKET_PAYLOAD_BYTES })
   const connections = new Map<string, WebSocket>()
   const contexts = new WeakMap<WebSocket, ConnectionContext>()
 
@@ -42,6 +45,11 @@ export function registerWebSocketGateway(
       if (key.startsWith(`${roomId}:`) && key !== connectionKey(roomId, exceptDeviceId ?? '')) {
         send(socket, message)
       }
+    }
+  }
+  const sendToPeer = (roomId: string, deviceId: string, message: ServerMessage) => {
+    for (const [key, socket] of connections) {
+      if (key.startsWith(`${roomId}:`) && key !== connectionKey(roomId, deviceId)) send(socket, message)
     }
   }
 
@@ -54,7 +62,7 @@ export function registerWebSocketGateway(
     try {
       const { device } = roomService.authorize(roomId, deviceToken)
       server.handleUpgrade(request, socket, head, (webSocket) => {
-        contexts.set(webSocket, { roomId, deviceToken, deviceId: device.id })
+        contexts.set(webSocket, { roomId, deviceToken, deviceId: device.id, role: device.role })
         server.emit('connection', webSocket, request)
       })
     } catch {
@@ -77,9 +85,17 @@ export function registerWebSocketGateway(
     send(socket, {
       type: 'session.ready',
       deviceId: context.deviceId,
+      role: context.role,
       roomStatus: room.status,
       peerOnline,
-      messages: room.messages,
+      verificationStatus: room.verificationStatus,
+      keyExchanges: Array.from(room.keyExchanges.values()).filter((event) => event.senderRole !== context.role),
+      messages: room.messages.map(({ id, senderRole, envelope, createdAt }) => ({
+        id,
+        senderRole,
+        envelope,
+        createdAt,
+      })),
     })
     broadcast(context.roomId, { type: 'peer.online' }, context.deviceId)
     if (room.status === 'paired') broadcast(context.roomId, { type: 'room.paired' })
@@ -109,45 +125,77 @@ export function registerWebSocketGateway(
           roomService.closeRoom(context.roomId, context.deviceToken)
           return
         }
-        if (message.type === 'text.send') {
-          const result = roomService.addTextMessage(
+        if (message.type === 'key.exchange') {
+          const event = roomService.exchangeKey(
             context.roomId,
             context.deviceToken,
-            message.clientMessageId,
-            message.text,
+            message.publicKey,
+            message.proof,
           )
-          send(socket, { type: 'message.ack', clientMessageId: message.clientMessageId })
-          if (!result.duplicate) {
-            const event: MessageDeliverEvent = { type: 'message.deliver', message: result.message }
-            broadcast(context.roomId, event, context.deviceId)
+          sendToPeer(context.roomId, context.deviceId, event)
+          return
+        }
+        if (message.type === 'verification.confirm') {
+          const status = roomService.confirmVerification(context.roomId, context.deviceToken, message.matched)
+          broadcast(context.roomId, { type: 'verification.status', status })
+          if (status === 'failed') {
+            broadcast(context.roomId, { type: 'session.closed' })
+            roomService.closeRoom(context.roomId, context.deviceToken)
           }
           return
         }
-        if (message.type === 'image.send') {
-          const result = roomService.addImageMessage(
+        if (message.type === 'webrtc.offer' || message.type === 'webrtc.restart') {
+          roomService.startNegotiation(context.roomId, context.deviceToken, message.negotiationId)
+          sendToPeer(context.roomId, context.deviceId, { ...message, senderRole: 'creator' })
+          return
+        }
+        if (message.type === 'webrtc.answer') {
+          roomService.acceptAnswer(context.roomId, context.deviceToken, message.negotiationId)
+          sendToPeer(context.roomId, context.deviceId, { ...message, senderRole: 'joiner' })
+          return
+        }
+        if (message.type === 'webrtc.ice') {
+          roomService.consumeIceCandidate(context.roomId, context.deviceToken, message.negotiationId)
+          sendToPeer(context.roomId, context.deviceId, { ...message, senderRole: context.role })
+          return
+        }
+        if (message.type === 'transfer.fallback') {
+          const result = roomService.addEncryptedMessage(
             context.roomId,
             context.deviceToken,
-            message.clientMessageId,
-            message.image,
+            message.envelope,
           )
-          send(socket, { type: 'message.ack', clientMessageId: message.clientMessageId })
+          send(socket, { type: 'message.ack', messageId: message.envelope.messageId })
           if (!result.duplicate) {
-            broadcast(
-              context.roomId,
-              { type: 'message.deliver', message: result.message },
-              context.deviceId,
-            )
+            const event: MessageDeliverEvent = { type: 'message.deliver', message: result.message }
+            sendToPeer(context.roomId, context.deviceId, event)
           }
+          return
+        }
+        if (message.type === 'image.fallback') {
+          const image = roomService.getOwnEncryptedImage(
+            context.roomId,
+            context.deviceToken,
+            message.transferId,
+            message.imageId,
+          )
+          sendToPeer(context.roomId, context.deviceId, {
+            type: 'image.deliver',
+            transferId: image.transferId,
+            imageId: image.imageId,
+            senderRole: context.role,
+            createdAt: image.createdAt,
+          })
           return
         }
         if (message.type === 'message.retry') {
           const existing = roomService.getMessage(
             context.roomId,
             context.deviceToken,
-            message.clientMessageId,
+            message.messageId,
           )
-          send(socket, { type: 'message.ack', clientMessageId: message.clientMessageId })
-          broadcast(context.roomId, { type: 'message.deliver', message: existing }, context.deviceId)
+          send(socket, { type: 'message.ack', messageId: message.messageId })
+          sendToPeer(context.roomId, context.deviceId, { type: 'message.deliver', message: existing })
           return
         }
         send(socket, errorEvent({ code: 'MESSAGE_INVALID', message: '消息类型尚未支持' }))

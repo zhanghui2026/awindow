@@ -12,7 +12,9 @@ AWindow 是一个无需注册和登录的双设备临时传输工具。用户可
 - JPEG、PNG、WebP、GIF 图片传输
 - 图片预览、原图查看和下载
 - 单张图片最大 10 MB
-- WebSocket 在线状态与消息确认
+- 一次性 ECDH 密钥协商与端到端 AES-GCM 加密
+- WebRTC DataChannel 直连优先，WebSocket/HTTP 密文自动回退
+- 跨直连与回退通道统一去重
 - 60 秒断线重连和会话消息恢复
 - 5 分钟待配对有效期
 - 房间数据仅保存在进程内存
@@ -129,6 +131,11 @@ Vite 会把 `/api`、`/health` 和 `/ws` 代理到 `127.0.0.1:3001`。
 | `PORT` | `3001` | Fastify 服务端口 |
 | `PUBLIC_BASE_URL` | `http://localhost:<PORT>` | 二维码和加入链接使用的公网基础地址 |
 | `TRUST_PROXY` | `false` | 是否信任反向代理传递的客户端地址；仅在受控代理后设置为 `true` |
+| `WEBRTC_STUN_URLS` | 空 | 逗号分隔的 `stun:` 或 `stuns:` URL |
+| `WEBRTC_TURN_URLS` | 空 | 逗号分隔的 `turn:` 或 `turns:` URL |
+| `WEBRTC_TURN_USERNAME` | 空 | TURN 用户名，配置 TURN URL 时必填 |
+| `WEBRTC_TURN_CREDENTIAL` | 空 | TURN 凭据，配置 TURN URL 时必填 |
+| `WEBRTC_NEGOTIATION_TIMEOUT_MS` | `10000` | WebRTC 协商超时，范围 1000 至 30000 毫秒 |
 
 生产环境必须把 `PUBLIC_BASE_URL` 设置为用户实际访问的 HTTPS 地址：
 
@@ -300,6 +307,8 @@ npm run build
 ## 数据与安全说明
 
 - 设备令牌和配对码在服务端以 SHA-256 摘要存储。
+- 文字、图片内容、文件名和 MIME 类型仅在已验证的两个浏览器端解密。
+- 直连与回退通道传输相同的端到端加密内容，并共享传输标识去重。
 - 房间、文字和图片不会写入数据库或磁盘。
 - 单个进程最多保存 25 MB 图片数据。
 - 同一来源一分钟内累计 10 次无效配对后暂停 5 分钟。

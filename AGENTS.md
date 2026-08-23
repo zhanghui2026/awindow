@@ -32,9 +32,9 @@ npm start
 - 保持每个房间最多两台设备和单进程内存存储边界。
 - 协议变更同步更新 `shared/protocol.ts`、测试和接口文档。
 - 浏览器显示用户输入时使用纯文本 DOM API。
-- 保持 WebSocket/HTTP 传输可用；WebRTC 规划采用直连优先和自动回退。
+- 保持 WebRTC 直连优先以及 WebSocket/HTTP 密文自动回退；服务端只处理中转密文。
 - 不修改与 AWindow 无关的 NodeLoc 文件。
 
 ## 当前状态
 
-基础房间、配对、文字和图片传输、断线恢复、限流、生产编译与双端 E2E 已完成。WebRTC DataChannel 仍处于需求和技术设计阶段，规格位于 `.monkeycode/specs/2026-07-19-webrtc-data-transfer/`。
+基础房间、端到端加密配对、WebRTC DataChannel、文字和图片密文回退、直连恢复时的恢复状态交换与缺失消息/图片分块重传、限流、生产编译与双端 E2E 已完成，规格位于 `.monkeycode/specs/2026-07-19-webrtc-data-transfer/`。

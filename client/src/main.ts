@@ -3,11 +3,22 @@ import QRCode from 'qrcode'
 import {
   MAX_IMAGE_BYTES,
   MAX_TEXT_LENGTH,
+  VERIFICATION_TTL_MS,
   type ApiError,
-  type MessageDeliverEvent,
+  type DeviceRole,
+  type KeyExchangeEvent,
   type ServerMessage,
 } from '../../shared/protocol.js'
+import { CryptoSession } from './crypto-session.js'
+import { isGroupedWithPrevious, trimOverflow } from './message-list.js'
+import { PeerTransport, type PeerSignal, type PeerTransportState } from './peer-transport.js'
 import { TransferClient, type StoredSession } from './transfer-client.js'
+import {
+  TransferProtocol,
+  type TransferImageEvent,
+  type TransferImageProgressEvent,
+  type TransferTextEvent,
+} from './transfer-protocol.js'
 
 function generateUUID(): string {
   if (typeof globalThis.crypto?.randomUUID === 'function') {
@@ -28,12 +39,34 @@ const SESSION_KEY = 'temporary-transfer-session'
 const root = document.querySelector<HTMLElement>('#app')
 let client: TransferClient | undefined
 let session: StoredSession | undefined
-let messages: MessageDeliverEvent['message'][] = []
+let cryptoSession: CryptoSession | undefined
+let safetyNumber: string | undefined
+let verificationStatus: 'pending' | 'verified' | 'failed' = 'pending'
+let locallyConfirmed = false
+let verificationTimer: number | undefined
+let peerTransport: PeerTransport | undefined
+let transferProtocol: TransferProtocol | undefined
+let peerTransportState: PeerTransportState = 'connecting'
+let peerSetupGeneration = 0
+const pendingPeerSignals: PeerSignal[] = []
+const invitationSecretFromFragment = consumeInvitationSecret()
+interface DisplayMessage {
+  id: string
+  kind: 'text' | 'image'
+  senderRole: DeviceRole
+  text?: string
+  image?: { fileName: string; mimeType: string; bytes: Uint8Array<ArrayBuffer> }
+  createdAt: number
+}
+
+let messages: DisplayMessage[] = []
+let sendQueue: Promise<void> = Promise.resolve()
 let connectionState: 'connecting' | 'online' | 'offline' = 'connecting'
 let peerOnline = false
 let pendingImage: File | undefined
 let pendingImagePreviewUrl: string | undefined
-const messageImageUrls = new Set<string>()
+const messageImageUrlsById = new Map<string, string>()
+const renderedMessageIds: string[] = []
 
 function icon(name: string): string {
   const paths: Record<string, string> = {
@@ -51,6 +84,30 @@ function setSession(value?: StoredSession): void {
   session = value
   if (value) sessionStorage.setItem(SESSION_KEY, JSON.stringify(value))
   else sessionStorage.removeItem(SESSION_KEY)
+}
+
+function consumeInvitationSecret(): string | undefined {
+  const secret = new URLSearchParams(location.hash.slice(1)).get('k') ?? undefined
+  if (location.hash) history.replaceState({}, '', `${location.pathname}${location.search}`)
+  return secret
+}
+
+function qrJoinUrl(): string | undefined {
+  if (!session?.joinUrl || !session.crypto?.invitationSecret) return undefined
+  const url = new URL(session.joinUrl, location.href)
+  url.hash = `k=${session.crypto.invitationSecret}`
+  return url.toString()
+}
+
+function normalizeJoinUrl(joinUrl: string): string {
+  const source = new URL(joinUrl, location.href)
+  return new URL(`${source.pathname}${source.search}`, location.origin).toString()
+}
+
+async function persistCryptoSession(): Promise<void> {
+  if (!session || !cryptoSession) return
+  session.crypto = await cryptoSession.export()
+  setSession(session)
 }
 
 function errorMessage(error: unknown): string {
@@ -113,8 +170,10 @@ async function createRoom(): Promise<void> {
   const button = root?.querySelector<HTMLButtonElement>('.action-create')
   if (button) button.disabled = true
   try {
+    const invitationSecret = CryptoSession.generateInvitationSecret()
     const created = await TransferClient.createRoom()
-    setSession(created)
+    cryptoSession = await CryptoSession.create(created.roomId, 'creator', invitationSecret)
+    setSession({ ...created, joinUrl: normalizeJoinUrl(created.joinUrl), crypto: await cryptoSession.export() })
     renderPairing()
     startClient()
   } catch (error) {
@@ -131,9 +190,14 @@ async function joinRoom(event: Event): Promise<void> {
     if (error) error.textContent = '请输入完整的 6 位配对码'
     return
   }
+  if (invitationSecretFromFragment && !CryptoSession.isInvitationSecret(invitationSecretFromFragment)) {
+    if (error) error.textContent = '二维码邀请密钥无效'
+    return
+  }
   try {
     const joined = await TransferClient.joinRoom(input.value)
-    setSession(joined)
+    cryptoSession = await CryptoSession.create(joined.roomId, 'joiner', invitationSecretFromFragment)
+    setSession({ ...joined, crypto: await cryptoSession.export() })
     renderTransfer()
     startClient()
   } catch (reason) {
@@ -152,7 +216,8 @@ async function renderPairing(): Promise<void> {
       </section>
     </main>`
   const canvas = root.querySelector<HTMLCanvasElement>('#qr')
-  if (canvas && session.joinUrl) await QRCode.toCanvas(canvas, session.joinUrl, { width: 220, margin: 1, color: { dark: '#141614', light: '#ffffff' } })
+  const joinUrl = qrJoinUrl()
+  if (canvas && joinUrl) await QRCode.toCanvas(canvas, joinUrl, { width: 220, margin: 1, color: { dark: '#141614', light: '#ffffff' } })
   root.querySelector('.code-copy')?.addEventListener('click', async () => {
     await copyText(session?.pairingCode ?? '')
   })
@@ -169,31 +234,201 @@ function updateCountdown(): void {
   else showToast('配对码已失效，请重新创建房间')
 }
 
-function startClient(): void {
+async function startClient(): Promise<void> {
   if (!session) return
+  try {
+    cryptoSession ??= session.crypto ? await CryptoSession.restore(session.crypto) : undefined
+  } catch {
+    showToast('无法恢复端到端加密会话')
+    leaveSession()
+    return
+  }
+  if (!cryptoSession) {
+    showToast('端到端加密会话不可用')
+    leaveSession()
+    return
+  }
   client = new TransferClient(session)
-  client.addEventListener('connected', () => { connectionState = 'online'; updateStatus() })
+  transferProtocol = new TransferProtocol({
+    cryptoSession,
+    sendDirect: frame => peerTransport?.send(frame) ?? false,
+    sendDirectBinary: frame => peerTransport?.sendWithBackpressure(frame) ?? Promise.resolve(false),
+    sendFallback: envelope => client?.send({ type: 'transfer.fallback', envelope }) ?? false,
+    sendImageFallback: async (transferId, bytes) => {
+      if (!client) throw new Error('图片回退通道不可用')
+      const image = await client.uploadEncryptedImage(transferId, bytes)
+      if (!client.send({ type: 'image.fallback', transferId, imageId: image.imageId })) {
+        throw new Error('图片回退通知发送失败')
+      }
+    },
+    onText: addTextMessage,
+    onImage: addImageMessage,
+    onImageProgress: updateImageProgress,
+    onError: () => showToast('加密内容认证失败'),
+    persistCryptoSession,
+    createMessageId: generateUUID,
+  })
+  client.addEventListener('connected', () => {
+    connectionState = 'online'
+    updateStatus()
+  })
   client.addEventListener('disconnected', () => { connectionState = 'offline'; updateStatus() })
   client.addEventListener('expired', () => { showToast('会话连接已失效'); leaveSession() })
   client.addEventListener('message', (event) => handleServerMessage((event as CustomEvent<ServerMessage>).detail))
   client.connect()
 }
 
+function isPeerSignal(message: ServerMessage): message is PeerSignal {
+  return message.type === 'webrtc.offer'
+    || message.type === 'webrtc.answer'
+    || message.type === 'webrtc.ice'
+    || message.type === 'webrtc.restart'
+}
+
+async function setupPeerTransport(reset = false): Promise<void> {
+  if (!client || !cryptoSession || verificationStatus !== 'verified' || !peerOnline) return
+  if (peerTransport && !reset) return
+  const generation = ++peerSetupGeneration
+  peerTransport?.close()
+  peerTransport = undefined
+  peerTransportState = 'connecting'
+  updateStatus()
+  try {
+    const config = await client.webRtcConfig()
+    if (generation !== peerSetupGeneration || !client || !cryptoSession) return
+    const transport = new PeerTransport({
+      role: cryptoSession.role,
+      iceServers: config.iceServers,
+      negotiationTimeoutMs: config.negotiationTimeoutMs,
+      sendSignal: message => client?.send(message) ?? false,
+      createNegotiationId: generateUUID,
+    })
+    peerTransport = transport
+    transport.addEventListener('statechange', () => {
+      peerTransportState = transport.state
+      void transferProtocol?.handleTransportState(transport.state)
+      updateStatus()
+    })
+    transport.addEventListener('message', event => {
+      void transferProtocol?.handleDirect((event as MessageEvent).data)
+    })
+    for (const signal of pendingPeerSignals.splice(0)) await transport.handleSignal(signal)
+    await transport.start()
+  } catch {
+    if (generation !== peerSetupGeneration) return
+    peerTransportState = 'fallback'
+    updateStatus()
+  }
+}
+
+async function sendKeyExchange(): Promise<void> {
+  if (!client || !cryptoSession) return
+  const proof = await cryptoSession.publicKeyProof()
+  client.send({ type: 'key.exchange', publicKey: cryptoSession.publicKey(), ...(proof ? { proof } : {}) })
+}
+
+async function initializeKeyExchange(exchanges: KeyExchangeEvent[]): Promise<void> {
+  await sendKeyExchange()
+  for (const exchange of exchanges) await handleKeyExchange(exchange)
+}
+
+async function handleKeyExchange(message: KeyExchangeEvent): Promise<void> {
+  if (!cryptoSession || message.senderRole === cryptoSession.role) return
+  const hasInvitationSecret = Boolean(session?.crypto?.invitationSecret)
+  const usesQrVerification = hasInvitationSecret && Boolean(message.proof)
+  if (usesQrVerification && !await cryptoSession.verifyPublicKeyProof(message.senderRole, message.publicKey, message.proof!)) {
+    failVerification('密钥验证失败，会话已关闭')
+    return
+  }
+  try {
+    if (hasInvitationSecret && !message.proof) cryptoSession.useManualVerification()
+    safetyNumber = await cryptoSession.establish(message.publicKey)
+    await persistCryptoSession()
+    if (usesQrVerification) client?.send({ type: 'verification.confirm', matched: true })
+    renderVerificationState()
+  } catch {
+    failVerification('密钥验证失败，会话已关闭')
+  }
+}
+
+function startVerificationTimeout(): void {
+  if (!session || verificationStatus !== 'pending') return
+  session.verificationExpiresAt ??= Date.now() + VERIFICATION_TTL_MS
+  setSession(session)
+  window.clearTimeout(verificationTimer)
+  verificationTimer = window.setTimeout(
+    () => failVerification('验证码确认超时，会话已关闭'),
+    Math.max(0, session.verificationExpiresAt - Date.now()),
+  )
+}
+
+function confirmSafetyNumber(matched: boolean): void {
+  if (!safetyNumber || verificationStatus !== 'pending') return
+  client?.send({ type: 'verification.confirm', matched })
+  if (!matched) failVerification('验证码不一致，会话已关闭')
+  else {
+    locallyConfirmed = true
+    renderVerificationState()
+  }
+}
+
+function failVerification(message: string): void {
+  verificationStatus = 'failed'
+  client?.send({ type: 'verification.confirm', matched: false })
+  showToast(message)
+  void client?.close()
+  leaveSession()
+}
+
 function handleServerMessage(message: ServerMessage): void {
   if (message.type === 'session.ready') {
-    messages = message.messages
+    messages = []
     peerOnline = message.peerOnline
+    verificationStatus = message.verificationStatus
     if (message.roomStatus === 'paired') renderTransfer()
     renderMessages()
+    if (message.verificationStatus === 'pending') {
+      if (message.roomStatus === 'paired') startVerificationTimeout()
+      void initializeKeyExchange(message.keyExchanges)
+    } else if (message.verificationStatus === 'verified') {
+      void restoreTransferHistory(message.messages)
+      void setupPeerTransport(true)
+    }
   } else if (message.type === 'room.paired') {
     renderTransfer()
+    startVerificationTimeout()
+  } else if (message.type === 'key.exchange') {
+    void handleKeyExchange(message)
+  } else if (message.type === 'verification.status') {
+    verificationStatus = message.status
+    if (message.status === 'verified') {
+      window.clearTimeout(verificationTimer)
+      if (session) {
+        session.verificationExpiresAt = undefined
+        setSession(session)
+      }
+      void setupPeerTransport()
+    }
+    renderVerificationState()
   } else if (message.type === 'peer.online') {
-    peerOnline = true; updateStatus()
+    peerOnline = true
+    updateStatus()
+    if (verificationStatus === 'verified') {
+      if (cryptoSession?.role === 'creator' && peerTransport) void peerTransport.restart()
+      else void setupPeerTransport()
+    }
   } else if (message.type === 'peer.offline') {
     peerOnline = false; updateStatus()
+  } else if (isPeerSignal(message)) {
+    if (peerTransport) void peerTransport.handleSignal(message)
+    else {
+      pendingPeerSignals.push(message)
+      void setupPeerTransport()
+    }
   } else if (message.type === 'message.deliver') {
-    if (!messages.some((item) => item.id === message.message.id)) messages.push(message.message)
-    renderMessages()
+    void transferProtocol?.handleFallback(message.message)
+  } else if (message.type === 'image.deliver') {
+    void handleImageDelivery(message)
   } else if (message.type === 'session.closed') {
     showToast('对方已结束会话'); leaveSession()
   } else if (message.type === 'error') {
@@ -201,12 +436,87 @@ function handleServerMessage(message: ServerMessage): void {
   }
 }
 
+async function handleImageDelivery(message: Extract<ServerMessage, { type: 'image.deliver' }>): Promise<void> {
+  if (!client || !transferProtocol) return
+  try {
+    const bytes = await client.fetchEncryptedImage(message.imageId)
+    await transferProtocol.handleImageFallback(bytes, message.senderRole, message.createdAt, message.transferId)
+  } catch {
+    showToast('加密图片回退接收失败')
+  }
+}
+
+async function restoreTransferHistory(records: Extract<ServerMessage, { type: 'session.ready' }>['messages']): Promise<void> {
+  for (const record of [...records].sort((left, right) => left.createdAt - right.createdAt)) {
+    await transferProtocol?.handleFallback(record, true)
+  }
+  renderMessages()
+}
+
+function addTextMessage(event: TransferTextEvent): void {
+  ingestMessage({
+    id: event.id,
+    kind: 'text',
+    senderRole: event.senderRole,
+    text: event.text,
+    createdAt: event.createdAt,
+  })
+}
+
+function addImageMessage(event: TransferImageEvent): void {
+  ingestMessage({
+    id: event.id,
+    kind: 'image',
+    senderRole: event.senderRole,
+    image: { fileName: event.fileName, mimeType: event.mimeType, bytes: event.bytes },
+    createdAt: event.createdAt,
+  })
+}
+
+function ingestMessage(message: DisplayMessage): void {
+  if (messages.some(existing => existing.id === message.id)) return
+  messages.push(message)
+  messages.sort(compareDisplayMessages)
+  trimRenderedMessages()
+  const index = messages.findIndex(existing => existing.id === message.id)
+  const list = root?.querySelector<HTMLElement>('.message-list')
+  if (list && index === messages.length - 1 && renderedMessageIds.length === messages.length - 1) {
+    appendMessageNode(message, messages[index - 1])
+    renderedMessageIds.push(message.id)
+    toggleEmptyState()
+    scrollMessages()
+    return
+  }
+  renderMessages()
+}
+
+function trimRenderedMessages(): void {
+  const removed = trimOverflow(messages)
+  if (!removed.length) return
+  const list = root?.querySelector<HTMLElement>('.message-list')
+  for (const message of removed) {
+    releaseMessageImage(message.id)
+    list?.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`)?.remove()
+    renderedMessageIds.shift()
+  }
+}
+
+function compareDisplayMessages(left: DisplayMessage, right: DisplayMessage): number {
+  return left.createdAt - right.createdAt || left.id.localeCompare(right.id)
+}
+
+function updateImageProgress(event: TransferImageProgressEvent): void {
+  if (event.direction !== 'sending') return
+  const progress = root?.querySelector<HTMLElement>('.image-preview .transfer-progress')
+  if (progress) progress.textContent = `${formatBytes(event.transferredBytes)} / ${formatBytes(event.totalBytes)}`
+}
+
 function renderTransfer(): void {
   if (!root) return
   root.innerHTML = `
     <main class="workspace">
       <header class="workspace-header"><div class="brand"><span class="brand-mark">T</span><span>临时传送</span></div><div class="connection-pill"><span></span><b>连接中</b></div><button class="text-button end-session" type="button">结束会话</button></header>
-      <section class="messages" aria-live="polite"><div class="empty-state"><div class="empty-icon">${icon('send')}</div><h2>传输空间已就绪</h2><p>发送一段文字，或选择一张图片</p></div></section>
+      <section class="messages" aria-live="polite"><div class="verification-panel"></div><div class="empty-state"><div class="empty-icon">${icon('send')}</div><h2>传输空间已就绪</h2><p>发送一段文字，或选择一张图片</p></div><div class="message-list"></div></section>
       <section class="composer">
         <div class="image-preview"></div>
         <div class="composer-row">
@@ -228,80 +538,137 @@ function renderTransfer(): void {
   })
   root.querySelector('.send-button')?.addEventListener('click', sendContent)
   updateStatus()
+  renderVerificationState()
   renderMessages()
+}
+
+function renderVerificationState(): void {
+  const panel = root?.querySelector<HTMLElement>('.verification-panel')
+  const controls = root?.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLButtonElement>('.composer input, .composer textarea, .composer .send-button')
+  const verified = verificationStatus === 'verified'
+  controls?.forEach(control => { control.disabled = !verified })
+  if (!panel) return
+  if (verified) {
+    panel.className = 'verification-panel verified'
+    panel.textContent = '端到端加密已验证'
+    return
+  }
+  if (session?.crypto?.invitationSecret) {
+    panel.className = 'verification-panel pending'
+    panel.textContent = safetyNumber ? '正在等待双方完成二维码密钥验证' : '正在建立端到端加密会话'
+    return
+  }
+  panel.className = 'verification-panel pending'
+  if (!safetyNumber) {
+    panel.textContent = '正在生成安全验证码'
+    return
+  }
+  panel.innerHTML = `<p>请在两台设备上核对安全验证码</p><strong>${safetyNumber}</strong><div><button class="secondary safety-match" type="button">验证码一致</button><button class="text-button safety-mismatch" type="button">验证码不一致</button></div>${locallyConfirmed ? '<small>已确认，正在等待另一台设备</small>' : ''}`
+  panel.querySelector('.safety-match')?.addEventListener('click', () => confirmSafetyNumber(true))
+  panel.querySelector('.safety-mismatch')?.addEventListener('click', () => confirmSafetyNumber(false))
 }
 
 function updateStatus(): void {
   const pill = root?.querySelector('.connection-pill')
   if (!pill) return
   const label = pill.querySelector('b')
-  pill.className = `connection-pill ${connectionState}`
-  if (label) label.textContent = connectionState === 'offline' ? '正在重连' : peerOnline ? '两台设备在线' : '等待对方上线'
+  const state = peerTransportState === 'direct' ? 'online' : connectionState
+  pill.className = `connection-pill ${state}`
+  if (!label) return
+  if (peerTransportState === 'direct') label.textContent = '设备直连'
+  else if (connectionState === 'offline') label.textContent = '信令重连中'
+  else if (!peerOnline) label.textContent = '等待对方上线'
+  else if (peerTransportState === 'fallback') label.textContent = '加密中转'
+  else label.textContent = '正在建立直连'
 }
 
 function renderMessages(): void {
   const container = root?.querySelector<HTMLElement>('.messages')
-  if (!container || !client) return
-  if (messages.length === 0) return
-  for (const url of messageImageUrls) URL.revokeObjectURL(url)
-  messageImageUrls.clear()
-  container.innerHTML = ''
+  const list = root?.querySelector<HTMLElement>('.message-list')
+  if (!container || !list || !client) return
+  for (const url of messageImageUrlsById.values()) URL.revokeObjectURL(url)
+  messageImageUrlsById.clear()
+  list.innerHTML = ''
+  renderedMessageIds.length = 0
+  toggleEmptyState()
+  let previous: DisplayMessage | undefined
   for (const message of messages) {
-    const item = document.createElement('article')
-    item.className = 'message-item'
-    const meta = document.createElement('div')
-    meta.className = 'message-meta'
-    meta.textContent = new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    item.append(meta)
-    if (message.kind === 'text') {
-      const content = document.createElement('pre')
-      content.textContent = message.text ?? ''
-      const copy = document.createElement('button')
-      copy.className = 'icon-button message-action'
-      copy.title = '复制文字'
-      copy.innerHTML = icon('copy')
-       copy.addEventListener('click', () => { void copyText(message.text ?? '') })
-      item.append(content, copy)
-    } else if (message.image) {
-      const image = document.createElement('div')
-      image.className = 'image-message'
-      image.innerHTML = `<div class="image-placeholder">${icon('image')}</div><div><strong></strong><small>${formatBytes(message.image.size)}</small></div>`
-      image.querySelector('strong')!.textContent = message.image.fileName
-      const download = document.createElement('button')
-      download.className = 'icon-button message-action'
-      download.title = '下载图片'
-      download.innerHTML = icon('download')
-      download.addEventListener('click', () => downloadImage(message.image!.imageId, message.image!.fileName))
-      item.append(image, download)
-      void loadImagePreview(image, message.image.imageId)
-    }
-    container.append(item)
+    appendMessageNode(message, previous)
+    renderedMessageIds.push(message.id)
+    previous = message
   }
-  container.scrollTop = container.scrollHeight
+  scrollMessages()
 }
 
-async function loadImagePreview(target: HTMLElement, imageId: string): Promise<void> {
-  if (!client) return
-  try {
-    const blob = await client.fetchImage(imageId)
-    const url = URL.createObjectURL(blob)
-    messageImageUrls.add(url)
-    const preview = document.createElement('img')
-    preview.src = url
-    preview.alt = ''
-    preview.addEventListener('load', () => target.querySelector('.image-placeholder')?.replaceWith(preview))
-    preview.addEventListener('click', () => window.open(url, '_blank', 'noopener'))
-  } catch { /* The session may have ended while loading. */ }
+function appendMessageNode(message: DisplayMessage, previous: DisplayMessage | undefined): void {
+  const list = root?.querySelector<HTMLElement>('.message-list')
+  if (!list) return
+  const mine = message.senderRole === cryptoSession?.role
+  const grouped = isGroupedWithPrevious(previous, message)
+  const item = document.createElement('article')
+  item.className = `message-item ${mine ? 'mine' : 'theirs'}${grouped ? ' grouped' : ''}`
+  item.dataset.messageId = message.id
+  const meta = document.createElement('div')
+  meta.className = 'message-meta'
+  meta.textContent = `${mine ? '我' : '对方'} · ${new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+  item.append(meta)
+  if (message.kind === 'text') {
+    const content = document.createElement('pre')
+    content.textContent = message.text ?? ''
+    const copy = document.createElement('button')
+    copy.className = 'icon-button message-action'
+    copy.title = '复制文字'
+    copy.innerHTML = icon('copy')
+    copy.addEventListener('click', () => { void copyText(message.text ?? '') })
+    item.append(content, copy)
+  } else if (message.image) {
+    const image = document.createElement('div')
+    image.className = 'image-message'
+    image.innerHTML = `<div class="image-placeholder">${icon('image')}</div><div><strong></strong><small>${formatBytes(message.image.bytes.length)}</small></div>`
+    image.querySelector('strong')!.textContent = message.image.fileName
+    const download = document.createElement('button')
+    download.className = 'icon-button message-action'
+    download.title = '下载图片'
+    download.innerHTML = icon('download')
+    download.addEventListener('click', () => downloadImage(message.image!))
+    item.append(image, download)
+    loadImagePreview(message.id, image, message.image)
+  }
+  list.append(item)
 }
 
-async function downloadImage(imageId: string, fileName: string): Promise<void> {
-  if (!client) return
-  const blob = await client.fetchImage(imageId)
-  const anchor = document.createElement('a')
-  anchor.href = URL.createObjectURL(blob)
-  anchor.download = fileName
-  anchor.click()
-  window.setTimeout(() => URL.revokeObjectURL(anchor.href), 1000)
+function toggleEmptyState(): void {
+  root?.querySelector('.empty-state')?.toggleAttribute('hidden', messages.length > 0)
+}
+
+function scrollMessages(): void {
+  const container = root?.querySelector<HTMLElement>('.messages')
+  if (container) container.scrollTop = container.scrollHeight
+}
+
+function releaseMessageImage(messageId: string): void {
+  const url = messageImageUrlsById.get(messageId)
+  if (!url) return
+  URL.revokeObjectURL(url)
+  messageImageUrlsById.delete(messageId)
+}
+
+function loadImagePreview(messageId: string, target: HTMLElement, image: NonNullable<DisplayMessage['image']>): void {
+  const url = URL.createObjectURL(new Blob([image.bytes], { type: image.mimeType }))
+  messageImageUrlsById.set(messageId, url)
+  const preview = document.createElement('img')
+  preview.src = url
+  preview.alt = image.fileName
+  target.querySelector('.image-placeholder')?.replaceWith(preview)
+}
+
+function downloadImage(image: NonNullable<DisplayMessage['image']>): void {
+  const url = URL.createObjectURL(new Blob([image.bytes], { type: image.mimeType }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = image.fileName
+  link.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
 function selectImage(event: Event): void {
@@ -313,7 +680,7 @@ function selectImage(event: Event): void {
   pendingImage = file
   const preview = root?.querySelector<HTMLElement>('.image-preview')
   if (preview) {
-    preview.innerHTML = `<div><img src="${pendingImagePreviewUrl}" alt=""><span><strong></strong><small>${formatBytes(file.size)}</small></span><button class="icon-button" title="移除图片">${icon('x')}</button></div>`
+    preview.innerHTML = `<div><img src="${pendingImagePreviewUrl}" alt=""><span><strong></strong><small class="transfer-progress">${formatBytes(file.size)}</small></span><button class="icon-button" title="移除图片">${icon('x')}</button></div>`
     preview.querySelector('strong')!.textContent = file.name
     preview.querySelector('button')?.addEventListener('click', () => {
       pendingImage = undefined
@@ -324,28 +691,33 @@ function selectImage(event: Event): void {
   }
 }
 
-async function sendContent(): Promise<void> {
+function sendContent(): Promise<void> {
+  sendQueue = sendQueue.then(sendContentNow, sendContentNow)
+  return sendQueue
+}
+
+async function sendContentNow(): Promise<void> {
   const textarea = root?.querySelector<HTMLTextAreaElement>('textarea')
   if (!client || !textarea) return
   const text = textarea.value
   if (!text.trim() && !pendingImage) { showToast('请输入文字或选择图片'); return }
   try {
     if (text.trim()) {
-      const clientMessageId = generateUUID()
-      const sent = client.send({ type: 'text.send', clientMessageId, text })
-      if (!sent) throw new Error('offline')
+      await transferProtocol?.sendText(text)
       textarea.value = ''
-      textarea.dispatchEvent(new Event('input'))
+      const counter = root?.querySelector('.counter')
+      if (counter) counter.textContent = `0/${MAX_TEXT_LENGTH}`
     }
     if (pendingImage) {
-      const image = await client.uploadImage(pendingImage)
-      const sent = client.send({ type: 'image.send', clientMessageId: generateUUID(), image })
-      if (!sent) throw new Error('offline')
+      const image = pendingImage
+      await transferProtocol?.sendImage(image)
       pendingImage = undefined
       if (pendingImagePreviewUrl) URL.revokeObjectURL(pendingImagePreviewUrl)
       pendingImagePreviewUrl = undefined
-      const preview = document.querySelector('.image-preview')
+      const preview = root?.querySelector<HTMLElement>('.image-preview')
       if (preview) preview.innerHTML = ''
+      const input = root?.querySelector<HTMLInputElement>('input[type=file]')
+      if (input) input.value = ''
     }
   } catch (error) {
     showToast(errorMessage(error) === '操作失败，请稍后重试' ? '连接中断，内容发送失败' : errorMessage(error))
@@ -358,9 +730,24 @@ async function endSession(): Promise<void> {
 }
 
 function leaveSession(): void {
+  window.clearTimeout(verificationTimer)
+  peerSetupGeneration += 1
+  peerTransport?.close()
+  peerTransport = undefined
+  transferProtocol?.close()
+  transferProtocol = undefined
+  peerTransportState = 'connecting'
+  pendingPeerSignals.length = 0
+  client?.disconnect()
+  cryptoSession?.destroy()
+  cryptoSession = undefined
+  safetyNumber = undefined
+  verificationStatus = 'pending'
+  locallyConfirmed = false
   if (pendingImagePreviewUrl) URL.revokeObjectURL(pendingImagePreviewUrl)
-  for (const url of messageImageUrls) URL.revokeObjectURL(url)
-  messageImageUrls.clear()
+  for (const url of messageImageUrlsById.values()) URL.revokeObjectURL(url)
+  messageImageUrlsById.clear()
+  renderedMessageIds.length = 0
   pendingImagePreviewUrl = undefined
   pendingImage = undefined
   client = undefined
@@ -379,9 +766,16 @@ try {
   if (stored) {
     setSession(JSON.parse(stored) as StoredSession)
     session?.pairingCode ? void renderPairing() : renderTransfer()
-    startClient()
+    void startClient()
   } else renderHome()
 } catch {
   setSession()
   renderHome()
 }
+
+window.addEventListener('pagehide', () => {
+  peerTransport?.close()
+  transferProtocol?.close()
+  client?.disconnect()
+  cryptoSession?.destroy()
+})

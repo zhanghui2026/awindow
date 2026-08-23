@@ -9,6 +9,25 @@ describe('room HTTP routes', () => {
     await Promise.all(apps.splice(0).map((app) => app.close()))
   })
 
+  async function verifiedRoom(app: Awaited<ReturnType<typeof buildApp>>) {
+    const created = (await app.inject({ method: 'POST', url: '/api/rooms' })).json<{
+      roomId: string
+      pairingCode: string
+      deviceToken: string
+    }>()
+    const joined = (await app.inject({
+      method: 'POST',
+      url: '/api/rooms/join',
+      payload: { pairingCode: created.pairingCode },
+    })).json<{ deviceToken: string }>()
+    const service = app.getDecorator<import('./room-service.js').RoomService>('roomService')
+    service.exchangeKey(created.roomId, created.deviceToken, 'creator-key', 'proof')
+    service.exchangeKey(created.roomId, joined.deviceToken, 'joiner-key')
+    service.confirmVerification(created.roomId, created.deviceToken, true)
+    service.confirmVerification(created.roomId, joined.deviceToken, true)
+    return { ...created, joinerToken: joined.deviceToken }
+  }
+
   it('creates, joins and closes a room', async () => {
     const app = await buildApp({ publicBaseUrl: 'https://transfer.example.com' })
     apps.push(app)
@@ -65,24 +84,63 @@ describe('room HTTP routes', () => {
     expect(response.json()).toMatchObject({ code: 'SESSION_UNAUTHORIZED' })
   })
 
-  it('uploads and reads an authorized room image', async () => {
-    const app = await buildApp()
+  it('returns ICE configuration only to an authorized room device', async () => {
+    const webRtcConfig = {
+      iceServers: [
+        { urls: ['stun:stun.example.com'] },
+        { urls: ['turns:turn.example.com'], username: 'device', credential: 'secret' },
+      ],
+      negotiationTimeoutMs: 8_000,
+    }
+    const app = await buildApp({ webRtcConfig })
     apps.push(app)
     const created = (await app.inject({ method: 'POST', url: '/api/rooms' })).json<{
       roomId: string
       deviceToken: string
     }>()
+
+    const authorized = await app.inject({
+      method: 'GET',
+      url: `/api/webrtc/config?roomId=${created.roomId}`,
+      headers: { authorization: `Bearer ${created.deviceToken}` },
+    })
+    expect(authorized.statusCode).toBe(200)
+    expect(authorized.json()).toEqual(webRtcConfig)
+
+    const unauthorized = await app.inject({
+      method: 'GET',
+      url: `/api/webrtc/config?roomId=${created.roomId}`,
+      headers: { authorization: 'Bearer invalid' },
+    })
+    expect(unauthorized.statusCode).toBe(401)
+  })
+
+  it('uploads and reads an authorized room image', async () => {
+    const app = await buildApp()
+    apps.push(app)
+    const created = await verifiedRoom(app)
     const bytes = Buffer.from('test-image')
+    const transferId = '12345678-1234-4123-8123-123456789abc'
 
     const upload = await app.inject({
       method: 'POST',
       url: `/api/rooms/${created.roomId}/images`,
       headers: { authorization: `Bearer ${created.deviceToken}` },
-      payload: { fileName: 'test.png', mimeType: 'image/png', bytes: bytes.toString('base64') },
+      payload: { transferId, bytes: bytes.toString('base64') },
     })
     expect(upload.statusCode).toBe(201)
-    const image = upload.json<{ imageId: string; size: number }>()
+    const image = upload.json<{ imageId: string; transferId: string; size: number; duplicate: boolean }>()
     expect(image.size).toBe(bytes.length)
+    expect(image).toMatchObject({ transferId, duplicate: false })
+
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: `/api/rooms/${created.roomId}/images`,
+      headers: { authorization: `Bearer ${created.deviceToken}` },
+      payload: { transferId, bytes: bytes.toString('base64') },
+    })
+    expect(duplicate.statusCode).toBe(200)
+    expect(duplicate.json()).toMatchObject({ imageId: image.imageId, transferId, duplicate: true })
 
     const read = await app.inject({
       method: 'GET',
@@ -90,63 +148,39 @@ describe('room HTTP routes', () => {
       headers: { authorization: `Bearer ${created.deviceToken}` },
     })
     expect(read.statusCode).toBe(200)
-    expect(read.headers['content-type']).toContain('image/png')
+    expect(read.headers['content-type']).toContain('application/octet-stream')
+    expect(read.headers['content-disposition']).toBeUndefined()
     expect(read.rawPayload).toEqual(bytes)
   })
 
-  it('rejects unsupported and unauthorized image uploads', async () => {
+  it('rejects invalid and unauthorized encrypted image uploads', async () => {
     const app = await buildApp()
     apps.push(app)
-    const created = (await app.inject({ method: 'POST', url: '/api/rooms' })).json<{
-      roomId: string
-      deviceToken: string
-    }>()
-    const payload = { fileName: 'vector.svg', mimeType: 'image/svg+xml', bytes: 'dGVzdA==' }
+    const created = await verifiedRoom(app)
+    const payload = { bytes: '*invalid-base64*' }
 
-    const unsupported = await app.inject({
+    const invalid = await app.inject({
       method: 'POST',
       url: `/api/rooms/${created.roomId}/images`,
       headers: { authorization: `Bearer ${created.deviceToken}` },
-      payload,
+      payload: { transferId: '12345678-1234-4123-8123-123456789abc', ...payload },
     })
-    expect(unsupported.statusCode).toBe(415)
-    expect(unsupported.json()).toMatchObject({ code: 'IMAGE_TYPE_UNSUPPORTED' })
+    expect(invalid.statusCode).toBe(400)
+    expect(invalid.json()).toMatchObject({ code: 'ENCRYPTED_PAYLOAD_INVALID' })
 
     const unauthorized = await app.inject({
       method: 'POST',
       url: `/api/rooms/${created.roomId}/images`,
       headers: { authorization: 'Bearer invalid' },
-      payload: { ...payload, mimeType: 'image/png' },
+      payload: { transferId: '12345678-1234-4123-8123-123456789abc', bytes: 'dGVzdA==' },
     })
     expect(unauthorized.statusCode).toBe(401)
-  })
-
-  it('rejects invalid image file names', async () => {
-    const app = await buildApp()
-    apps.push(app)
-    const created = (await app.inject({ method: 'POST', url: '/api/rooms' })).json<{
-      roomId: string
-      deviceToken: string
-    }>()
-
-    const response = await app.inject({
-      method: 'POST',
-      url: `/api/rooms/${created.roomId}/images`,
-      headers: { authorization: `Bearer ${created.deviceToken}` },
-      payload: { fileName: '   ', mimeType: 'image/png', bytes: 'dGVzdA==' },
-    })
-
-    expect(response.statusCode).toBe(400)
-    expect(response.json()).toMatchObject({ code: 'IMAGE_METADATA_INVALID' })
   })
 
   it('isolates images between rooms', async () => {
     const app = await buildApp()
     apps.push(app)
-    const first = (await app.inject({ method: 'POST', url: '/api/rooms' })).json<{
-      roomId: string
-      deviceToken: string
-    }>()
+    const first = await verifiedRoom(app)
     const second = (await app.inject({ method: 'POST', url: '/api/rooms' })).json<{
       roomId: string
       deviceToken: string
@@ -155,7 +189,7 @@ describe('room HTTP routes', () => {
       method: 'POST',
       url: `/api/rooms/${first.roomId}/images`,
       headers: { authorization: `Bearer ${first.deviceToken}` },
-      payload: { fileName: 'private.png', mimeType: 'image/png', bytes: 'dGVzdA==' },
+      payload: { transferId: '12345678-1234-4123-8123-123456789abc', bytes: 'dGVzdA==' },
     })
     const { imageId } = upload.json<{ imageId: string }>()
 
@@ -204,7 +238,7 @@ describe('room HTTP routes', () => {
     expect(blocked.headers['retry-after']).toBe('60')
   })
 
-  it('adds security headers and preserves user-controlled text as data', async () => {
+  it('adds security headers and stores only encrypted transfer content', async () => {
     const app = await buildApp()
     apps.push(app)
     const response = await app.inject({ method: 'GET', url: '/health' })
@@ -216,13 +250,16 @@ describe('room HTTP routes', () => {
     expect(response.headers['permissions-policy']).toContain('camera=()')
     expect(response.headers['content-security-policy']).toContain("default-src 'self'")
 
-    const created = (await app.inject({ method: 'POST', url: '/api/rooms' })).json<{
-      roomId: string
-      deviceToken: string
-    }>()
+    const created = await verifiedRoom(app)
     const roomService = app.getDecorator<import('./room-service.js').RoomService>('roomService')
-    const text = '<img src=x onerror=alert(1)>'
-    const result = roomService.addTextMessage(created.roomId, created.deviceToken, 'plain-text', text)
-    expect(result.message.text).toBe(text)
+    const result = roomService.addEncryptedMessage(created.roomId, created.deviceToken, {
+      version: 1,
+      keyGeneration: 1,
+      messageId: 'encrypted-message',
+      nonce: 'AAAAAAAAAAAAAAAA',
+      ciphertext: 'A'.repeat(22),
+    })
+    expect(Object.keys(result.message)).not.toEqual(expect.arrayContaining(['text', 'fileName', 'mimeType']))
+    expect(result.message.envelope.ciphertext).toBe('A'.repeat(22))
   })
 })

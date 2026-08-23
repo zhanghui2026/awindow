@@ -1,7 +1,14 @@
-import type { ImageMetadata, RoomStatus } from '../../shared/protocol.js'
+import type {
+  DeviceRole,
+  EncryptedEnvelope,
+  KeyExchangeEvent,
+  RoomStatus,
+  VerificationStatus,
+} from '../../shared/protocol.js'
 
 export interface DeviceSession {
   id: string
+  role: DeviceRole
   tokenHash: string
   connected: boolean
   lastSeenAt: number
@@ -9,15 +16,16 @@ export interface DeviceSession {
 
 export interface TransferMessage {
   id: string
-  clientMessageId: string
   senderDeviceId: string
-  kind: 'text' | 'image'
-  text?: string
-  image?: ImageMetadata
+  senderRole: DeviceRole
+  envelope: EncryptedEnvelope
   createdAt: number
 }
 
-export interface ImageAsset extends ImageMetadata {
+export interface EncryptedImageAsset {
+  imageId: string
+  transferId: string
+  senderDeviceId: string
   bytes: Buffer
   createdAt: number
 }
@@ -31,5 +39,11 @@ export interface Room {
   disconnectExpiresAt?: number
   devices: Map<string, DeviceSession>
   messages: TransferMessage[]
-  images: Map<string, ImageAsset>
+  images: Map<string, EncryptedImageAsset>
+  keyExchanges: Map<DeviceRole, KeyExchangeEvent>
+  verificationStatus: VerificationStatus
+  verificationConfirmations: Set<DeviceRole>
+  verificationExpiresAt?: number
+  negotiationId?: string
+  iceCandidateCount: number
 }
