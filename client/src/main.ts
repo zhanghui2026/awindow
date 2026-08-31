@@ -3,7 +3,6 @@ import QRCode from 'qrcode'
 import {
   MAX_IMAGE_BYTES,
   MAX_TEXT_LENGTH,
-  VERIFICATION_TTL_MS,
   type ApiError,
   type DeviceRole,
   type KeyExchangeEvent,
@@ -40,10 +39,7 @@ const root = document.querySelector<HTMLElement>('#app')
 let client: TransferClient | undefined
 let session: StoredSession | undefined
 let cryptoSession: CryptoSession | undefined
-let safetyNumber: string | undefined
 let verificationStatus: 'pending' | 'verified' | 'failed' = 'pending'
-let locallyConfirmed = false
-let verificationTimer: number | undefined
 let peerTransport: PeerTransport | undefined
 let transferProtocol: TransferProtocol | undefined
 let peerTransportState: PeerTransportState = 'connecting'
@@ -342,33 +338,12 @@ async function handleKeyExchange(message: KeyExchangeEvent): Promise<void> {
   }
   try {
     if (hasInvitationSecret && !message.proof) cryptoSession.useManualVerification()
-    safetyNumber = await cryptoSession.establish(message.publicKey)
+    await cryptoSession.establish(message.publicKey)
     await persistCryptoSession()
-    if (usesQrVerification) client?.send({ type: 'verification.confirm', matched: true })
+    client?.send({ type: 'verification.confirm', matched: true })
     renderVerificationState()
   } catch {
     failVerification('密钥验证失败，会话已关闭')
-  }
-}
-
-function startVerificationTimeout(): void {
-  if (!session || verificationStatus !== 'pending') return
-  session.verificationExpiresAt ??= Date.now() + VERIFICATION_TTL_MS
-  setSession(session)
-  window.clearTimeout(verificationTimer)
-  verificationTimer = window.setTimeout(
-    () => failVerification('验证码确认超时，会话已关闭'),
-    Math.max(0, session.verificationExpiresAt - Date.now()),
-  )
-}
-
-function confirmSafetyNumber(matched: boolean): void {
-  if (!safetyNumber || verificationStatus !== 'pending') return
-  client?.send({ type: 'verification.confirm', matched })
-  if (!matched) failVerification('验证码不一致，会话已关闭')
-  else {
-    locallyConfirmed = true
-    renderVerificationState()
   }
 }
 
@@ -388,21 +363,18 @@ function handleServerMessage(message: ServerMessage): void {
     if (message.roomStatus === 'paired') renderTransfer()
     renderMessages()
     if (message.verificationStatus === 'pending') {
-      if (message.roomStatus === 'paired') startVerificationTimeout()
-      void initializeKeyExchange(message.keyExchanges)
+    void initializeKeyExchange(message.keyExchanges)
     } else if (message.verificationStatus === 'verified') {
       void restoreTransferHistory(message.messages)
       void setupPeerTransport(true)
     }
   } else if (message.type === 'room.paired') {
     renderTransfer()
-    startVerificationTimeout()
   } else if (message.type === 'key.exchange') {
     void handleKeyExchange(message)
   } else if (message.type === 'verification.status') {
     verificationStatus = message.status
     if (message.status === 'verified') {
-      window.clearTimeout(verificationTimer)
       if (session) {
         session.verificationExpiresAt = undefined
         setSession(session)
@@ -550,22 +522,13 @@ function renderVerificationState(): void {
   if (!panel) return
   if (verified) {
     panel.className = 'verification-panel verified'
-    panel.textContent = '端到端加密已验证'
-    return
-  }
-  if (session?.crypto?.invitationSecret) {
-    panel.className = 'verification-panel pending'
-    panel.textContent = safetyNumber ? '正在等待双方完成二维码密钥验证' : '正在建立端到端加密会话'
+    const fingerprint = cryptoSession?.fingerprint()
+    panel.textContent = fingerprint ? `端到端加密已建立 · 密钥指纹 ${fingerprint}` : '端到端加密已建立'
+    panel.title = fingerprint ? '两侧设备显示相同指纹即代表通信密钥一致，可人工比对确认无中间人' : ''
     return
   }
   panel.className = 'verification-panel pending'
-  if (!safetyNumber) {
-    panel.textContent = '正在生成安全验证码'
-    return
-  }
-  panel.innerHTML = `<p>请在两台设备上核对安全验证码</p><strong>${safetyNumber}</strong><div><button class="secondary safety-match" type="button">验证码一致</button><button class="text-button safety-mismatch" type="button">验证码不一致</button></div>${locallyConfirmed ? '<small>已确认，正在等待另一台设备</small>' : ''}`
-  panel.querySelector('.safety-match')?.addEventListener('click', () => confirmSafetyNumber(true))
-  panel.querySelector('.safety-mismatch')?.addEventListener('click', () => confirmSafetyNumber(false))
+  panel.textContent = '正在建立端到端加密会话'
 }
 
 function updateStatus(): void {
@@ -730,7 +693,6 @@ async function endSession(): Promise<void> {
 }
 
 function leaveSession(): void {
-  window.clearTimeout(verificationTimer)
   peerSetupGeneration += 1
   peerTransport?.close()
   peerTransport = undefined
@@ -741,9 +703,7 @@ function leaveSession(): void {
   client?.disconnect()
   cryptoSession?.destroy()
   cryptoSession = undefined
-  safetyNumber = undefined
   verificationStatus = 'pending'
-  locallyConfirmed = false
   if (pendingImagePreviewUrl) URL.revokeObjectURL(pendingImagePreviewUrl)
   for (const url of messageImageUrlsById.values()) URL.revokeObjectURL(url)
   messageImageUrlsById.clear()

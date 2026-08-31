@@ -65,15 +65,16 @@
 - `validateText`：检查文字类型、空白内容和长度上限，返回结构化 API 错误。
 - `validateEncryptedEnvelope`：严格校验版本、密钥代次、消息标识、规范 Base64URL nonce、GCM 密文和字段集合。
 - `parseClientMessage`：严格解析密钥交换、验证、信令、密文回退和控制消息，拒绝额外字段。
+- `parseSessionAuthMessage`：严格校验 WebSocket 首条 `session.auth` 消息中的房间标识和设备令牌。
 - `validateImageUpload`：校验图片 MIME 类型和原始字节数。
 
 ## WebSocket 接口
 
-### `GET /ws?roomId=<ROOM_ID>&deviceToken=<DEVICE_TOKEN>`
+### `GET /ws`
 
-使用房间标识和设备令牌建立连接。鉴权失败时握手返回 `401`。连接成功后服务端立即发送 `session.ready`，其中包含当前设备标识、固定角色、房间状态、对端在线状态、验证状态、对端公钥交换记录和密文历史。
+建立 WebSocket 连接时握手不携带任何凭据。连接打开后，客户端必须立即发送首条 `session.auth` 消息（`{ type: "session.auth", roomId, deviceToken }`）完成鉴权；首条消息缺失、格式错误或令牌无效时服务端以关闭码 `4401` 关闭连接，10 秒内未发送鉴权消息同样关闭。鉴权成功后服务端立即发送 `session.ready`，其中包含当前设备标识、固定角色、房间状态、对端在线状态、验证状态、对端公钥交换记录和密文历史。
 
-已实现的客户端消息包括 `key.exchange`、`verification.confirm`、`webrtc.offer`、`webrtc.answer`、`webrtc.ice`、`webrtc.restart`、`transfer.fallback`、`image.fallback`、`message.retry`、`session.close` 和 `ping`。服务端只向同房间对端定向转发密钥与信令，为事件注入可信发送角色，并要求双方验证完成后才接收密文回退。`image.fallback` 仅引用当前发送设备已经上传且 `transferId` 匹配的临时密文包，对端收到 `image.deliver` 后通过授权 HTTP 接口下载。相同发送设备和消息标识的相同密文只返回确认，冲突密文返回 `MESSAGE_CONFLICT`。`ping` 返回 `pong`。
+已实现的客户端消息包括 `key.exchange`、`verification.confirm`（客户端在密钥建立后自动发送）、`webrtc.offer`、`webrtc.answer`、`webrtc.ice`、`webrtc.restart`、`transfer.fallback`、`image.fallback`、`message.retry`、`session.close` 和 `ping`。服务端只向同房间对端定向转发密钥与信令，为事件注入可信发送角色，并要求双方确认完成后才接收密文回退。`image.fallback` 仅引用当前发送设备已经上传且 `transferId` 匹配的临时密文包，对端收到 `image.deliver` 后通过授权 HTTP 接口下载。相同发送设备和消息标识的相同密文只返回确认，冲突密文返回 `MESSAGE_CONFLICT`。`ping` 返回 `pong`。
 
 设备连接和断开时，对端分别收到 `peer.online` 和 `peer.offline`。设备在 60 秒宽限期内使用原令牌重连时，`session.ready` 会恢复房间中的消息视图。任一设备发送 `session.close` 后，连接中的设备收到 `session.closed`，房间内存随即清理。
 
@@ -85,9 +86,9 @@
 
 ## 浏览器客户端
 
-客户端首页提供创建房间和输入配对码两个入口。创建成功后，浏览器生成一次性邀请秘密并仅将其附加到二维码加入 URL 的 `#k=` Fragment；扫码页面在应用启动时消费并清除 Fragment。第二台设备连接后，两端交换一次性临时公钥。二维码流程验证公钥 HMAC 证明并自动确认，手动配对流程显示 12 位短验证码并等待双方确认。验证完成前文字、图片和发送控件保持禁用。
+客户端首页提供创建房间和输入配对码两个入口。创建成功后，浏览器生成一次性邀请秘密并仅将其附加到二维码加入 URL 的 `#k=` Fragment；扫码页面在应用启动时消费并清除 Fragment。第二台设备连接后，两端交换一次性临时公钥。二维码流程验证公钥 HMAC 证明，双方完成密钥交换后客户端自动确认并建立加密会话。加密会话建立前文字、图片和发送控件保持禁用。
 
-验证完成后，客户端创建 `awindow-transfer` 可靠有序 DataChannel。创建方固定发送 Offer 和重启信令，加入方固定发送 Answer，双方交换当前协商轮次的 ICE 候选。状态栏显示“正在建立直连”“设备直连”或“加密中转”；10 秒超时、连接失败和通道关闭会启用回退状态，创建方自动发起新协商。
+验证完成后，客户端创建 `awindow-transfer` 可靠有序 DataChannel。创建方固定发送 Offer 和重启信令，加入方固定发送 Answer，双方交换当前协商轮次的 ICE 候选。状态栏显示“正在建立直连”“设备直连”或“加密中转”；10 秒超时、连接失败和通道关闭会启用回退状态，创建方自动发起新协商。加密建立后面板显示由双方共享密钥经 HKDF 派生的 64 位密钥指纹（16 位十六进制、4 位一组），两侧一致代表通信密钥相同，可用于人工比对确认无中间人。
 
 文字 DataChannel 外层帧仅包含 `type: "transfer.encrypted"` 和严格校验的 `EncryptedEnvelope`。解密载荷包含文字或 ACK，文字正文和 ACK 目标均位于 AES-GCM 密文中。发送端等待端到端加密 ACK，5 秒后重试一次；第二次超时或直连不可用时发送相同 `transfer.fallback` 信封。`message.ack` 仅表示服务端已接受密文，接收端生成的加密 ACK 表示内容已认证。
 

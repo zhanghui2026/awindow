@@ -1,11 +1,10 @@
-import type { IncomingMessage } from 'node:http'
-
 import type { FastifyInstance } from 'fastify'
 import { WebSocket, WebSocketServer } from 'ws'
 
 import {
   MAX_WEBSOCKET_PAYLOAD_BYTES,
   parseClientMessage,
+  parseSessionAuthMessage,
   type ApiError,
   type DeviceRole,
   type MessageDeliverEvent,
@@ -37,7 +36,6 @@ export function registerWebSocketGateway(
 ): void {
   const server = new WebSocketServer({ noServer: true, maxPayload: MAX_WEBSOCKET_PAYLOAD_BYTES })
   const connections = new Map<string, WebSocket>()
-  const contexts = new WeakMap<WebSocket, ConnectionContext>()
 
   const connectionKey = (roomId: string, deviceId: string) => `${roomId}:${deviceId}`
   const broadcast = (roomId: string, message: ServerMessage, exceptDeviceId?: string) => {
@@ -56,25 +54,12 @@ export function registerWebSocketGateway(
   app.server.on('upgrade', (request, socket, head) => {
     const url = new URL(request.url ?? '/', 'http://localhost')
     if (url.pathname !== '/ws') return
-
-    const roomId = url.searchParams.get('roomId') ?? ''
-    const deviceToken = url.searchParams.get('deviceToken') ?? ''
-    try {
-      const { device } = roomService.authorize(roomId, deviceToken)
-      server.handleUpgrade(request, socket, head, (webSocket) => {
-        contexts.set(webSocket, { roomId, deviceToken, deviceId: device.id, role: device.role })
-        server.emit('connection', webSocket, request)
-      })
-    } catch {
-      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
-      socket.destroy()
-    }
+    server.handleUpgrade(request, socket, head, (webSocket) => {
+      server.emit('connection', webSocket, request)
+    })
   })
 
-  server.on('connection', (socket: WebSocket, _request: IncomingMessage) => {
-    const context = contexts.get(socket)
-    if (!context) return socket.close(1011, 'Missing context')
-
+  const initializeConnection = (socket: WebSocket, context: ConnectionContext): void => {
     const key = connectionKey(context.roomId, context.deviceId)
     const messageLimiter = new RateLimiter({ limit: 60, windowMs: 60_000, blockMs: 60_000 }, now)
     const previous = connections.get(key)
@@ -216,6 +201,41 @@ export function registerWebSocketGateway(
       } catch {
         // The room may already have been closed by either device.
       }
+    })
+  }
+
+  server.on('connection', (socket: WebSocket) => {
+    let authenticated = false
+    const authTimer = setTimeout(() => {
+      if (!authenticated) socket.close(4401, 'Auth timeout')
+    }, 10_000)
+
+    socket.once('message', (raw) => {
+      let decoded: unknown
+      try {
+        decoded = JSON.parse(raw.toString())
+      } catch {
+        return socket.close(4401, 'Unauthorized')
+      }
+      const auth = parseSessionAuthMessage(decoded)
+      if (!('type' in auth)) return socket.close(4401, 'Unauthorized')
+      try {
+        const { device } = roomService.authorize(auth.roomId, auth.deviceToken)
+        authenticated = true
+        clearTimeout(authTimer)
+        initializeConnection(socket, {
+          roomId: auth.roomId,
+          deviceToken: auth.deviceToken,
+          deviceId: device.id,
+          role: device.role,
+        })
+      } catch {
+        socket.close(4401, 'Unauthorized')
+      }
+    })
+
+    socket.on('close', () => {
+      clearTimeout(authTimer)
     })
   })
 

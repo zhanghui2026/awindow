@@ -97,7 +97,7 @@ export function unpadBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
 export class CryptoSession {
   private sendKey?: CryptoKey
   private receiveKey?: CryptoKey
-  private safetyNumber?: string
+  private keyFingerprint?: string
   private peerPublicKey?: string
   private sendCounter: bigint
   private readonly receivedNonces: Set<string>
@@ -260,15 +260,19 @@ export class CryptoSession {
     )
     this.sendKey = await deriveKey(`${this.role}-to-${peerRole(this.role)}`)
     this.receiveKey = await deriveKey(`${peerRole(this.role)}-to-${this.role}`)
-    const safetyBytes = new Uint8Array(await crypto.subtle.deriveBits(
-      { name: 'HKDF', hash: 'SHA-256', salt, info: concatBytes(transcript, encoder.encode('\0safety-number')) },
+    const fingerprintBytes = new Uint8Array(await crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt, info: concatBytes(transcript, encoder.encode('\0key-fingerprint')) },
       material,
       64,
     ))
-    const safetyValue = safetyBytes.reduce((value, byte) => (value << 8n) | BigInt(byte), 0n) % 1_000_000_000_000n
-    this.safetyNumber = safetyValue.toString().padStart(12, '0').match(/.{1,3}/gu)?.join(' ') ?? ''
+    const fingerprintHex = Array.from(fingerprintBytes, byte => byte.toString(16).padStart(2, '0')).join('')
+    this.keyFingerprint = (fingerprintHex.match(/.{1,4}/gu) ?? []).join(' ')
     this.peerPublicKey = publicKey
-    return this.safetyNumber
+    return this.keyFingerprint
+  }
+
+  fingerprint(): string | undefined {
+    return this.keyFingerprint
   }
 
   async encrypt(messageId: string, plaintext: Uint8Array<ArrayBuffer>): Promise<EncryptedEnvelope> {
@@ -339,7 +343,7 @@ export class CryptoSession {
   destroy(): void {
     this.sendKey = undefined
     this.receiveKey = undefined
-    this.safetyNumber = undefined
+    this.keyFingerprint = undefined
     this.peerPublicKey = undefined
     this.invitationSecret = undefined
     this.receivedNonces.clear()

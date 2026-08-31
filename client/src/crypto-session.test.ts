@@ -22,9 +22,9 @@ function randomBytes(length: number): Uint8Array<ArrayBuffer> {
 async function pairedSessions(roomId = 'room-1', invitationSecret = CryptoSession.generateInvitationSecret()) {
   const creator = await CryptoSession.create(roomId, 'creator', invitationSecret)
   const joiner = await CryptoSession.create(roomId, 'joiner', invitationSecret)
-  const creatorSafety = await creator.establish(joiner.publicKey())
-  const joinerSafety = await joiner.establish(creator.publicKey())
-  return { creator, joiner, creatorSafety, joinerSafety }
+  const creatorFingerprint = await creator.establish(joiner.publicKey())
+  const joinerFingerprint = await joiner.establish(creator.publicKey())
+  return { creator, joiner, creatorFingerprint, joinerFingerprint }
 }
 
 describe('CryptoSession', () => {
@@ -34,16 +34,28 @@ describe('CryptoSession', () => {
     expect(CryptoSession.isInvitationSecret('AQ')).toBe(false)
   })
 
-  it('derives matching safety numbers and directional encryption keys', async () => {
-    const { creator, joiner, creatorSafety, joinerSafety } = await pairedSessions()
-    expect(creatorSafety).toBe(joinerSafety)
-    expect(creatorSafety).toMatch(/^\d{3} \d{3} \d{3} \d{3}$/u)
+  it('derives matching key fingerprints and directional encryption keys', async () => {
+    const { creator, joiner, creatorFingerprint, joinerFingerprint } = await pairedSessions()
+    expect(creatorFingerprint).toBe(joinerFingerprint)
+    expect(creatorFingerprint).toMatch(/^[0-9a-f]{4}( [0-9a-f]{4}){3}$/u)
+    expect(creator.fingerprint()).toBe(creatorFingerprint)
 
     const envelope = await creator.encrypt('message-1', encoder.encode('hello'))
     expect(decoder.decode(await joiner.decrypt(envelope))).toBe('hello')
 
     const response = await joiner.encrypt('message-2', encoder.encode('world'))
     expect(decoder.decode(await creator.decrypt(response))).toBe('world')
+  })
+
+  it('derives mismatching key fingerprints when the peer key differs', async () => {
+    const invitationSecret = CryptoSession.generateInvitationSecret()
+    const creator = await CryptoSession.create('room-1', 'creator', invitationSecret)
+    const joiner = await CryptoSession.create('room-1', 'joiner', invitationSecret)
+    const attacker = await CryptoSession.create('room-1', 'joiner', invitationSecret)
+    await creator.establish(joiner.publicKey())
+    const creatorFingerprint = await creator.establish(attacker.publicKey())
+    const joinerFingerprint = await joiner.establish(creator.publicKey())
+    expect(creatorFingerprint).not.toBe(joinerFingerprint)
   })
 
   it('authenticates ephemeral public keys with the QR invitation secret', async () => {
@@ -62,10 +74,10 @@ describe('CryptoSession', () => {
     const joiner = await CryptoSession.create('room-1', 'joiner')
 
     creator.useManualVerification()
-    const creatorSafety = await creator.establish(joiner.publicKey())
-    const joinerSafety = await joiner.establish(creator.publicKey())
+    const creatorFingerprint = await creator.establish(joiner.publicKey())
+    const joinerFingerprint = await joiner.establish(creator.publicKey())
 
-    expect(creatorSafety).toBe(joinerSafety)
+    expect(creatorFingerprint).toBe(joinerFingerprint)
     expect((await creator.export()).invitationSecret).toBeUndefined()
   })
 
@@ -109,6 +121,7 @@ describe('CryptoSession', () => {
 
     expect(second.nonce).not.toBe(first.nonce)
     expect(decoder.decode(await joiner.decrypt(second))).toBe('second')
+    expect(restored.fingerprint()).toBe(creator.fingerprint())
   })
 
   it('pads and unpads text and image payload boundaries', () => {

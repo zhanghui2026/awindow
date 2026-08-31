@@ -136,6 +136,12 @@ export interface SessionCloseMessage {
   type: 'session.close'
 }
 
+export interface SessionAuthMessage {
+  type: 'session.auth'
+  roomId: string
+  deviceToken: string
+}
+
 export interface PingMessage {
   type: 'ping'
 }
@@ -311,6 +317,18 @@ function parseDescription(candidate: Record<string, unknown>, type: 'offer' | 'a
     negotiationId: candidate.negotiationId,
     description: { type, sdp: value.sdp },
   } as WebRtcOfferMessage | WebRtcAnswerMessage
+}
+
+export function parseSessionAuthMessage(value: unknown): SessionAuthMessage | ApiError {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return invalidMessage
+  const candidate = value as Record<string, unknown>
+  if (
+    candidate.type !== 'session.auth'
+    || !hasExactKeys(candidate, ['type', 'roomId', 'deviceToken'])
+    || !isValidIdentifier(candidate.roomId)
+    || !isValidIdentifier(candidate.deviceToken)
+  ) return invalidMessage
+  return { type: 'session.auth', roomId: candidate.roomId, deviceToken: candidate.deviceToken }
 }
 
 export function parseClientMessage(value: unknown): ClientMessage | ApiError {

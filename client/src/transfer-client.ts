@@ -4,6 +4,7 @@ import type {
   EncryptedImageUploadResponse,
   JoinRoomResponse,
   ServerMessage,
+  SessionAuthMessage,
   WebRtcConfigResponse,
 } from '../../shared/protocol.js'
 import type { StoredCryptoSession } from './crypto-session.js'
@@ -50,10 +51,15 @@ export class TransferClient extends EventTarget {
   connect(): void {
     window.clearTimeout(this.reconnectTimer)
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const url = `${protocol}//${location.host}/ws?roomId=${encodeURIComponent(this.session.roomId)}&deviceToken=${encodeURIComponent(this.session.deviceToken)}`
+    const url = `${protocol}//${location.host}/ws`
     this.socket = new WebSocket(url)
     this.socket.addEventListener('open', () => {
       this.reconnectStartedAt = undefined
+      this.socket?.send(JSON.stringify({
+        type: 'session.auth',
+        roomId: this.session.roomId,
+        deviceToken: this.session.deviceToken,
+      } satisfies SessionAuthMessage))
       this.dispatchEvent(new Event('connected'))
       this.heartbeatTimer = window.setInterval(() => this.send({ type: 'ping' }), 25_000)
     })
@@ -68,7 +74,7 @@ export class TransferClient extends EventTarget {
     this.socket.addEventListener('close', (event) => {
       window.clearInterval(this.heartbeatTimer)
       this.dispatchEvent(new Event('disconnected'))
-      if (event.code === 4001 || event.code === 1000) return
+      if (event.code === 4001 || event.code === 1000 || event.code === 4401) return
       this.scheduleReconnect()
     })
   }

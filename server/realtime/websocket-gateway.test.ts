@@ -1,7 +1,6 @@
 import { once } from 'node:events'
 
 import type { FastifyInstance } from 'fastify'
-import type { IncomingMessage } from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
 
@@ -18,8 +17,8 @@ interface TestSocket {
   next(type: ServerMessage['type']): Promise<ServerMessage>
 }
 
-async function connect(url: string): Promise<TestSocket> {
-  const socket = new WebSocket(url)
+async function connect(wsBase: string, roomId: string, deviceToken: string): Promise<TestSocket> {
+  const socket = new WebSocket(`${wsBase}/ws`)
   const queued: ServerMessage[] = []
   const waiting = new Map<ServerMessage['type'], ((message: ServerMessage) => void)[]>()
   socket.on('message', (raw) => {
@@ -29,6 +28,7 @@ async function connect(url: string): Promise<TestSocket> {
     else queued.push(message)
   })
   await once(socket, 'open')
+  socket.send(JSON.stringify({ type: 'session.auth', roomId, deviceToken }))
   return {
     socket,
     next(type) {
@@ -87,10 +87,10 @@ describe('WebSocket gateway', () => {
 
   async function connectedPair() {
     const fixture = await pairedFixture()
-    const creator = await connect(`${fixture.wsBase}/ws?roomId=${fixture.created.roomId}&deviceToken=${fixture.created.deviceToken}`)
+    const creator = await connect(fixture.wsBase, fixture.created.roomId, fixture.created.deviceToken)
     sockets.push(creator.socket)
     const creatorReady = await creator.next('session.ready')
-    const joiner = await connect(`${fixture.wsBase}/ws?roomId=${fixture.joined.roomId}&deviceToken=${fixture.joined.deviceToken}`)
+    const joiner = await connect(fixture.wsBase, fixture.joined.roomId, fixture.joined.deviceToken)
     sockets.push(joiner.socket)
     const joinerReady = await joiner.next('session.ready')
     return { ...fixture, creator, joiner, creatorReady, joinerReady }
@@ -114,12 +114,12 @@ describe('WebSocket gateway', () => {
 
   it('rejects invalid WebSocket credentials', async () => {
     const { created, wsBase } = await pairedFixture()
-    const socket = new WebSocket(`${wsBase}/ws?roomId=${created.roomId}&deviceToken=invalid`)
+    const socket = new WebSocket(`${wsBase}/ws`)
     socket.on('error', () => undefined)
-    const [, response] = await once(socket, 'unexpected-response') as [unknown, IncomingMessage]
-    expect(response.statusCode).toBe(401)
-    response.destroy()
-    socket.terminate()
+    await once(socket, 'open')
+    socket.send(JSON.stringify({ type: 'session.auth', roomId: created.roomId, deviceToken: 'invalid' }))
+    const [code] = await once(socket, 'close')
+    expect(code).toBe(4401)
   })
 
   it('assigns stable roles and forwards key exchange only to the peer', async () => {
@@ -146,7 +146,7 @@ describe('WebSocket gateway', () => {
 
     joiner.socket.close()
     await once(joiner.socket, 'close')
-    const reconnected = await connect(`${wsBase}/ws?roomId=${joined.roomId}&deviceToken=${joined.deviceToken}`)
+    const reconnected = await connect(wsBase, joined.roomId, joined.deviceToken)
     sockets.push(reconnected.socket)
     expect(await reconnected.next('session.ready')).toMatchObject({
       verificationStatus: 'verified',

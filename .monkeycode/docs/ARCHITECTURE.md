@@ -31,7 +31,7 @@ shared/
   protocol.test.ts
 ```
 
-`client` 是 Vite 浏览器入口，提供创建/加入首页、二维码配对页、密钥验证界面和响应式传输工作区。`TransferClient` 封装 HTTP、WebSocket、心跳、断线重连、ICE 配置获取和加密图片字节回退。`CryptoSession` 实现一次性 P-256 ECDH、HKDF-SHA-256、方向独立 AES-256-GCM 密钥、邀请秘密公钥证明、短验证码、填充、重放保护和当前标签页恢复。`PeerTransport` 实现固定角色 Offer/Answer、ICE 候选、可靠有序 DataChannel、10 秒协商超时、创建方自动重新协商和 DataChannel 背压等待。`TransferProtocol` 负责加密文字确认重试，加密图片元数据、固定分块、重组和摘要验证，以及直连恢复时的恢复状态交换、已确认消息清理和缺失图片分块重传。客户端创建房间时生成邀请秘密，二维码只在加入 URL Fragment 中携带秘密；扫码加入自动认证双方临时公钥，手动配对显示相同 12 位短验证码并等待双方确认。`server` 是 Fastify 服务入口，提供应用工厂、健康检查、房间 API、授权 ICE 配置和 WebSocket 升级入口。`server/rooms` 维护内存房间仓库、设备角色、加密验证状态、密文历史、加密图片字节及生命周期清理。`server/realtime` 负责设备连接绑定、密钥交换、验证确认、WebRTC 信令、密文回退和历史恢复。`shared` 定义浏览器和服务端共同使用的严格协议类型、限制常量及运行时校验。
+`client` 是 Vite 浏览器入口，提供创建/加入首页、二维码配对页、加密会话状态和响应式传输工作区。`TransferClient` 封装 HTTP、WebSocket、首消息鉴权、心跳、断线重连、ICE 配置获取和加密图片字节回退。`CryptoSession` 实现一次性 P-256 ECDH、HKDF-SHA-256、方向独立 AES-256-GCM 密钥、邀请秘密公钥证明、64 位会话密钥指纹派生、填充、重放保护和当前标签页恢复。`PeerTransport` 实现固定角色 Offer/Answer、ICE 候选、可靠有序 DataChannel、10 秒协商超时、创建方自动重新协商和 DataChannel 背压等待。`TransferProtocol` 负责加密文字确认重试，加密图片元数据、固定分块、重组和摘要验证，以及直连恢复时的恢复状态交换、已确认消息清理和缺失图片分块重传。客户端创建房间时生成邀请秘密，二维码只在加入 URL Fragment 中携带秘密；扫码加入自动认证双方临时公钥，配对码加入在双方密钥交换完成后自动建立加密会话。`server` 是 Fastify 服务入口，提供应用工厂、健康检查、房间 API、授权 ICE 配置和 WebSocket 升级入口。`server/rooms` 维护内存房间仓库、设备角色、加密验证状态、密文历史、加密图片字节及生命周期清理。`server/realtime` 负责设备连接绑定、密钥交换、自动验证、WebRTC 信令、密文回退和历史恢复。`shared` 定义浏览器和服务端共同使用的严格协议类型、限制常量及运行时校验。
 
 ## 房间生命周期
 
@@ -39,7 +39,7 @@ shared/
 
 ## 实时连接
 
-设备通过房间标识和设备令牌建立 WebSocket 连接。创建方与加入方角色在设备会话中固定保存，每个设备同时保留一个有效连接，重连会替换旧连接。服务端定向转发临时公钥、验证状态及 WebRTC Offer、Answer 和 ICE 候选；创建方固定发起协商，ICE 候选按协商轮次限制为 256 个。连接建立时通过 `session.ready` 返回设备角色、验证状态、对端公钥和当前密文历史。
+设备通过房间标识和设备令牌建立 WebSocket 连接：握手 URL 不携带凭据，连接打开后客户端必须立即发送 `session.auth` 首消息完成鉴权，失败或超时以关闭码 `4401` 拒绝。创建方与加入方角色在设备会话中固定保存，每个设备同时保留一个有效连接，重连会替换旧连接。服务端定向转发临时公钥、验证状态及 WebRTC Offer、Answer 和 ICE 候选；创建方固定发起协商，ICE 候选按协商轮次限制为 256 个。连接建立时通过 `session.ready` 返回设备角色、验证状态、对端公钥和当前密文历史。
 
 验证完成后，客户端使用设备令牌从 `GET /api/webrtc/config` 获取当前部署的 STUN/TURN 配置。创建方建立名为 `awindow-transfer` 的可靠有序 DataChannel 并发起 Offer，加入方响应 Answer；协商超时或连接失败时进入加密中转状态，创建方按新协商标识重试。WebSocket 恢复和页面刷新会重建 PeerConnection，房间结束、失效或页面离开时关闭 DataChannel 和 PeerConnection。
 
